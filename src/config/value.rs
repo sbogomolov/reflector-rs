@@ -336,10 +336,28 @@ mod tests {
     #[test]
     fn wol_ports_parse_via_fromstr() {
         let ports = "7, 9, 4000".parse::<WolPorts>().unwrap();
-        assert_eq!(ports.iter().map(|p| p.get()).collect::<Vec<_>>(), [7, 9, 4000]);
-        assert!(matches!("7,7".parse::<WolPorts>(), Err(WolPortsError::Duplicate(7))));
-        assert!(matches!("0".parse::<WolPorts>(), Err(WolPortsError::BadPort(_))));
-        assert!(matches!("abc".parse::<WolPorts>(), Err(WolPortsError::BadPort(_))));
-        assert_eq!(WolPorts::default().iter().map(|p| p.get()).collect::<Vec<_>>(), [7, 9]);
+        assert_eq!(
+            ports.iter().map(|p| p.get()).collect::<Vec<_>>(),
+            [7, 9, 4000]
+        );
+        assert!(matches!(
+            "7,7".parse::<WolPorts>(),
+            Err(WolPortsError::Duplicate(7))
+        ));
+        assert!(matches!(
+            "0".parse::<WolPorts>(),
+            Err(WolPortsError::BadPort(_))
+        ));
+        assert!(matches!(
+            "abc".parse::<WolPorts>(),
+            Err(WolPortsError::BadPort(_))
+        ));
+        assert_eq!(
+            WolPorts::default()
+                .iter()
+                .map(|p| p.get())
+                .collect::<Vec<_>>(),
+            [7, 9]
+        );
     }
 }

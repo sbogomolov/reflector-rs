@@ -21,7 +21,10 @@ pub(super) struct RawConfig {
     pub(super) reflectors: BTreeMap<String, RawReflector>,
 }
 
-#[expect(clippy::struct_excessive_bools, reason = "independent toggles, not a state machine")]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent toggles, not a state machine"
+)]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct RawReflector {

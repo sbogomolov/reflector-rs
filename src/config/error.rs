@@ -59,7 +59,9 @@ pub enum ConfigError {
     DialWithoutSsdp { name: ReflectorName },
 
     /// `dial` was enabled but the address family excludes IPv4.
-    #[error("reflector \"{name}\" enables dial but the address family has no IPv4 (DIAL is IPv4-only)")]
+    #[error(
+        "reflector \"{name}\" enables dial but the address family has no IPv4 (DIAL is IPv4-only)"
+    )]
     DialRequiresIpv4 { name: ReflectorName },
 
     /// A reflector was defined by both the configuration file and the environment.
@@ -67,7 +69,9 @@ pub enum ConfigError {
     DuplicateReflector { name: String },
 
     /// Two reflectors would reflect the same protocol's packets twice.
-    #[error("reflectors \"{first}\" and \"{second}\" both reflect {protocol} on {source_if} -> {target_if} with overlapping MAC selection and address family")]
+    #[error(
+        "reflectors \"{first}\" and \"{second}\" both reflect {protocol} on {source_if} -> {target_if} with overlapping MAC selection and address family"
+    )]
     ConflictingReflectors {
         protocol: Protocol,
         first: ReflectorName,
@@ -81,7 +85,9 @@ pub enum ConfigError {
     EnvMalformedVar { var: String },
 
     /// An environment variable's reflector tag was empty or non-alphanumeric.
-    #[error("environment variable \"{var}\" has invalid tag \"{tag}\" (tags must be non-empty and alphanumeric)")]
+    #[error(
+        "environment variable \"{var}\" has invalid tag \"{tag}\" (tags must be non-empty and alphanumeric)"
+    )]
     EnvInvalidTag { var: String, tag: String },
 
     /// An environment variable used a reserved tag (`LOG` and `DEBUG` name globals).

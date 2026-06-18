@@ -347,7 +347,10 @@ mod tests {
         assert!(r.mdns);
         let ssdp = r.ssdp.unwrap();
         assert!(ssdp.dial);
-        assert_eq!(wol.ports.iter().map(|p| p.get()).collect::<Vec<_>>(), [7, 9, 4000]);
+        assert_eq!(
+            wol.ports.iter().map(|p| p.get()).collect::<Vec<_>>(),
+            [7, 9, 4000]
+        );
         assert_eq!(r.address_family, AddressFamily::Dual);
     }
 
