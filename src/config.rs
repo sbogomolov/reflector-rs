@@ -3,7 +3,7 @@
 //! TOML is deserialized into a permissive raw form
 //! ([`RawConfig`]/[`RawReflector`]) and then validated into the strongly-typed
 //! [`Config`] the rest of the program uses. The typed values make illegal
-//! states unrepresentable (for example, [`Wol::ports`] exists only when WoL is
+//! states unrepresentable (for example, [`Wol::ports`] exists only when `WoL` is
 //! enabled).
 //!
 //! Errors split cleanly in two: value-level problems (wrong type, bad port,
@@ -73,11 +73,13 @@ pub enum AddressFamily {
 
 impl AddressFamily {
     /// Whether this family handles IPv4 traffic.
+    #[must_use]
     pub fn uses_ipv4(self) -> bool {
         matches!(self, Self::Default | Self::Dual | Self::Ipv4)
     }
 
     /// Whether this family handles IPv6 traffic.
+    #[must_use]
     pub fn uses_ipv6(self) -> bool {
         matches!(self, Self::Default | Self::Dual | Self::Ipv6)
     }
@@ -116,8 +118,8 @@ pub struct MacAddr([u8; 6]);
 
 impl fmt::Display for MacAddr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let [a, b, c, d, e, g] = self.0;
-        write!(f, "{a:02x}:{b:02x}:{c:02x}:{d:02x}:{e:02x}:{g:02x}")
+        let [b0, b1, b2, b3, b4, b5] = self.0;
+        write!(f, "{b0:02x}:{b1:02x}:{b2:02x}:{b3:02x}:{b4:02x}:{b5:02x}")
     }
 }
 
@@ -154,7 +156,7 @@ impl<'de> Deserialize<'de> for MacAddr {
     }
 }
 
-/// Wake-on-LAN settings (present only when WoL is enabled for the reflector).
+/// Wake-on-LAN settings (present only when `WoL` is enabled for the reflector).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Wol {
     /// UDP destination ports whose magic packets are relayed.
@@ -181,7 +183,7 @@ pub struct Reflector {
     pub mac: Option<MacAddr>,
     /// IP-version policy for this reflector.
     pub address_family: AddressFamily,
-    /// Wake-on-LAN settings, or `None` when WoL is disabled.
+    /// Wake-on-LAN settings, or `None` when `WoL` is disabled.
     pub wol: Option<Wol>,
     /// Whether mDNS reflection is enabled.
     pub mdns: bool,
@@ -202,6 +204,10 @@ pub struct Config {
 
 impl Config {
     /// Read and validate a configuration from a TOML file.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError::ReadFile`] if the file cannot be read, or a
+    /// parse/validation error from [`Config::from_toml_str`].
     pub fn from_toml_file(path: &str) -> Result<Self, ConfigError> {
         let text = std::fs::read_to_string(path).map_err(|source| ConfigError::ReadFile {
             path: path.to_owned(),
@@ -211,6 +217,10 @@ impl Config {
     }
 
     /// Parse and validate a configuration from TOML text.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError::Parse`] for malformed TOML or out-of-range values,
+    /// or a cross-field [`ConfigError`] variant if validation fails.
     pub fn from_toml_str(text: &str) -> Result<Self, ConfigError> {
         // First `?`: value-level errors (serde). Second call: cross-field rules.
         let raw: RawConfig = toml::from_str(text)?;
@@ -244,11 +254,11 @@ pub enum ConfigError {
     #[error("reflector \"{name}\" source_if and target_if must differ (both are \"{value}\")")]
     SameInterface { name: String, value: String },
 
-    /// The reflector enabled none of WoL, mDNS, or SSDP.
+    /// The reflector enabled none of `WoL`, mDNS, or SSDP.
     #[error("reflector \"{name}\" enables no protocol (set wol, mdns, or ssdp)")]
     NoProtocol { name: String },
 
-    /// `wol_ports` was set without enabling WoL.
+    /// `wol_ports` was set without enabling `WoL`.
     #[error("reflector \"{name}\" sets wol_ports but does not enable wol")]
     WolPortsWithoutWol { name: String },
 
@@ -274,6 +284,7 @@ struct RawConfig {
     reflectors: BTreeMap<String, RawReflector>,
 }
 
+#[expect(clippy::struct_excessive_bools, reason = "independent toggles, not a state machine")]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawReflector {

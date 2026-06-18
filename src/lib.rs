@@ -15,6 +15,9 @@ use config::Config;
 ///
 /// `args` is the process argument list with argv[0] already stripped. With a
 /// path argument, configuration is loaded from that TOML file.
+///
+/// # Errors
+/// Returns [`Error`] if configuration loading or validation fails.
 pub fn run(args: &[String]) -> Result<()> {
     match args.first() {
         Some(path) => {
