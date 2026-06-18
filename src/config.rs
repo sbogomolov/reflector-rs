@@ -8,8 +8,9 @@
 //!
 //! Each value type is a `FromStr` type with a matching `Deserialize`, so the same
 //! validation serves both the TOML path (via serde, with located errors) and the
-//! upcoming environment path (via `FromStr`, with variable-named errors).
-//! Cross-field and cross-reflector rules live in the `TryFrom` conversions.
+//! environment path (via `FromStr`, with variable-named errors). Cross-field and
+//! cross-reflector rules live in the `TryFrom` conversions, and file and
+//! environment settings are combined in [`Config::from_sources`].
 //!
 //! Reflectors are nested under a `reflectors` table (`[reflectors.<name>]`)
 //! rather than top-level tables: this keeps the deserializer off
@@ -199,6 +200,41 @@ impl<'de> Deserialize<'de> for InterfaceName {
     }
 }
 
+/// A reflector's display name: surrounding whitespace trimmed, never empty.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReflectorName(String);
+
+impl ReflectorName {
+    /// The name as a string slice.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ReflectorName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Error returned when a string is not a valid [`ReflectorName`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error("reflector name must not be empty or whitespace-only")]
+pub struct ParseReflectorNameError;
+
+impl FromStr for ReflectorName {
+    type Err = ParseReflectorNameError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            return Err(ParseReflectorNameError);
+        }
+        Ok(Self(trimmed.to_owned()))
+    }
+}
+
 /// A non-empty, duplicate-free list of Wake-on-LAN destination ports.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WolPorts(Vec<NonZeroU16>);
@@ -290,8 +326,9 @@ pub struct Ssdp {
 /// One reflector: bridges `source_if` → `target_if` for the enabled protocols.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reflector {
-    /// Name of the reflector (its key under `[reflectors.<name>]`), used in logs.
-    pub name: String,
+    /// Display name (from the `[reflectors.<name>]` key or `REFLECTOR_<tag>_NAME`),
+    /// used in logs; trimmed and never empty.
+    pub name: ReflectorName,
     /// Interface to listen on.
     pub source_if: InterfaceName,
     /// Interface to emit on (always different from `source_if`).
@@ -320,19 +357,6 @@ pub struct Config {
 }
 
 impl Config {
-    /// Read and validate a configuration from a TOML file.
-    ///
-    /// # Errors
-    /// Returns [`ConfigError::ReadFile`] if the file cannot be read, or a
-    /// parse/validation error from [`Config::from_toml_str`].
-    pub fn from_toml_file(path: &str) -> Result<Self, ConfigError> {
-        let text = std::fs::read_to_string(path).map_err(|source| ConfigError::ReadFile {
-            path: path.to_owned(),
-            source,
-        })?;
-        Self::from_toml_str(&text)
-    }
-
     /// Parse and validate a configuration from TOML text.
     ///
     /// # Errors
@@ -343,6 +367,53 @@ impl Config {
         let raw: RawConfig = toml::from_str(text)?;
         Config::try_from(raw)
     }
+
+    /// Load from an optional TOML file plus `REFLECTOR_*` environment variables.
+    ///
+    /// The file (if given) is read first; environment variables then override the
+    /// global settings and contribute additional reflectors. This is the entry
+    /// point the binary uses, passing [`std::env::vars`].
+    ///
+    /// # Errors
+    /// Returns [`ConfigError::ReadFile`] if the file cannot be read, or any
+    /// parse/merge/validation error from [`Config::from_sources`].
+    pub fn load(
+        path: Option<&str>,
+        env: impl IntoIterator<Item = (String, String)>,
+    ) -> Result<Self, ConfigError> {
+        let text = path.map(read_config_file).transpose()?;
+        Self::from_sources(text.as_deref(), env)
+    }
+
+    /// Build a configuration from optional TOML text plus environment variables.
+    ///
+    /// Environment variables take precedence over the file for the global
+    /// settings; reflectors from the two sources are combined, and a name defined
+    /// by both is rejected. Kept free of I/O so it can be exercised directly.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError::Parse`] for malformed TOML, an `Env*` variant for a
+    /// malformed or invalid environment variable, [`ConfigError::DuplicateReflector`]
+    /// when a name is defined by both sources, or any cross-field [`ConfigError`].
+    pub fn from_sources(
+        toml_text: Option<&str>,
+        env: impl IntoIterator<Item = (String, String)>,
+    ) -> Result<Self, ConfigError> {
+        let mut raw: RawConfig = match toml_text {
+            Some(text) => toml::from_str(text)?,
+            None => RawConfig::default(),
+        };
+        raw.merge_env(parse_env(env)?)?;
+        Config::try_from(raw)
+    }
+}
+
+/// Read a configuration file, mapping I/O failure to [`ConfigError::ReadFile`].
+fn read_config_file(path: &str) -> Result<String, ConfigError> {
+    std::fs::read_to_string(path).map_err(|source| ConfigError::ReadFile {
+        path: path.to_owned(),
+        source,
+    })
 }
 
 /// Everything that can make a configuration invalid.
@@ -367,36 +438,73 @@ pub enum ConfigError {
     #[error("must define at least one reflector")]
     NoReflectors,
 
+    /// A reflector's name (file table key) was empty or whitespace-only.
+    #[error("reflector name \"{key}\" is empty or whitespace-only")]
+    EmptyReflectorName { key: String },
+
     /// `source_if` and `target_if` were the same interface.
     #[error("reflector \"{name}\" source_if and target_if must differ (both are \"{value}\")")]
-    SameInterface { name: String, value: InterfaceName },
+    SameInterface {
+        name: ReflectorName,
+        value: InterfaceName,
+    },
 
     /// The reflector enabled none of `WoL`, mDNS, or SSDP.
     #[error("reflector \"{name}\" enables no protocol (set wol, mdns, or ssdp)")]
-    NoProtocol { name: String },
+    NoProtocol { name: ReflectorName },
 
     /// `wol_ports` was set without enabling `WoL`.
     #[error("reflector \"{name}\" sets wol_ports but does not enable wol")]
-    WolPortsWithoutWol { name: String },
+    WolPortsWithoutWol { name: ReflectorName },
 
     /// `dial` was set without enabling SSDP.
     #[error("reflector \"{name}\" sets dial but does not enable ssdp")]
-    DialWithoutSsdp { name: String },
+    DialWithoutSsdp { name: ReflectorName },
 
     /// `dial` was enabled but the address family excludes IPv4.
     #[error("reflector \"{name}\" enables dial but the address family has no IPv4 (DIAL is IPv4-only)")]
-    DialRequiresIpv4 { name: String },
+    DialRequiresIpv4 { name: ReflectorName },
+
+    /// A reflector was defined by both the configuration file and the environment.
+    #[error("reflector \"{name}\" is defined in both the configuration file and the environment")]
+    DuplicateReflector { name: String },
+
+    /// An environment variable was not of the form `REFLECTOR_<tag>_<param>`.
+    #[error("environment variable \"{var}\" is malformed (expected REFLECTOR_<tag>_<param>)")]
+    EnvMalformedVar { var: String },
+
+    /// An environment variable's reflector tag was empty or non-alphanumeric.
+    #[error("environment variable \"{var}\" has invalid tag \"{tag}\" (tags must be non-empty and alphanumeric)")]
+    EnvInvalidTag { var: String, tag: String },
+
+    /// An environment variable used a reserved tag (`LOG` and `DEBUG` name globals).
+    #[error("environment variable \"{var}\" uses a reserved tag (log and debug are globals)")]
+    EnvReservedTag { var: String },
+
+    /// An environment variable named a parameter no reflector has.
+    #[error("environment variable \"{var}\" sets unknown parameter \"{param}\"")]
+    EnvUnknownParam { var: String, param: String },
+
+    /// An environment value could not be parsed.
+    #[error("environment variable \"{var}\" has invalid value \"{value}\": {source}")]
+    EnvBadValue {
+        var: String,
+        value: String,
+        source: ParseValueError,
+    },
+
+    /// An environment-defined reflector is missing a required field.
+    #[error("reflector \"{name}\" (from the environment) has no {field}")]
+    EnvMissingField { name: String, field: RequiredField },
 }
 
 // ----- raw (serde) layer ---------------------------------------------------
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
-    #[serde(default)]
-    log_level: LogLevel,
-    #[serde(default)]
-    debug_memory: bool,
+    log_level: Option<LogLevel>,
+    debug_memory: Option<bool>,
     #[serde(default)]
     reflectors: BTreeMap<String, RawReflector>,
 }
@@ -405,6 +513,10 @@ struct RawConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawReflector {
+    /// Display name; set only by the environment layer (`REFLECTOR_<tag>_NAME`).
+    /// File reflectors take their name from the `[reflectors.<name>]` table key.
+    #[serde(skip)]
+    name: Option<ReflectorName>,
     source_if: InterfaceName,
     target_if: InterfaceName,
     mac: Option<MacAddr>,
@@ -436,8 +548,8 @@ impl TryFrom<RawConfig> for Config {
         }
 
         Ok(Config {
-            log_level: raw.log_level,
-            debug_memory: raw.debug_memory,
+            log_level: raw.log_level.unwrap_or_default(),
+            debug_memory: raw.debug_memory.unwrap_or_default(),
             reflectors,
         })
     }
@@ -446,7 +558,14 @@ impl TryFrom<RawConfig> for Config {
 impl TryFrom<(String, RawReflector)> for Reflector {
     type Error = ConfigError;
 
-    fn try_from((name, raw): (String, RawReflector)) -> Result<Self, ConfigError> {
+    fn try_from((key, raw): (String, RawReflector)) -> Result<Self, ConfigError> {
+        // Display name: the env `NAME` override (already validated) or the
+        // identity key (file table key / env tag), validated here.
+        let name = match raw.name {
+            Some(name) => name,
+            None => ReflectorName::from_str(&key)
+                .map_err(|_| ConfigError::EmptyReflectorName { key: key.clone() })?,
+        };
         let source_if = raw.source_if;
         let target_if = raw.target_if;
         if source_if == target_if {
@@ -495,6 +614,227 @@ impl TryFrom<(String, RawReflector)> for Reflector {
     }
 }
 
+// ----- environment layer ---------------------------------------------------
+
+/// A required reflector field, named in [`ConfigError::EnvMissingField`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequiredField {
+    /// The listen interface (`source_if`).
+    SourceIf,
+    /// The emit interface (`target_if`).
+    TargetIf,
+}
+
+impl fmt::Display for RequiredField {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::SourceIf => "source_if",
+            Self::TargetIf => "target_if",
+        })
+    }
+}
+
+/// Error returned when a string is not a recognized boolean.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error("expected true, false, 1, or 0")]
+pub struct ParseBoolError;
+
+/// Any value-level parse failure an environment variable can carry.
+///
+/// Aggregating the per-type errors keeps [`ConfigError::EnvBadValue`] structured
+/// (matchable in tests) while still attaching the originating variable name.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum ParseValueError {
+    /// A `LOG_LEVEL` value was not a valid log level.
+    #[error(transparent)]
+    LogLevel(#[from] ParseLogLevelError),
+    /// An `ADDRESS_FAMILY` value was not a valid address family.
+    #[error(transparent)]
+    AddressFamily(#[from] ParseAddressFamilyError),
+    /// A `MAC` value was not a valid MAC address.
+    #[error(transparent)]
+    Mac(#[from] ParseMacAddrError),
+    /// A `SOURCE_IF`/`TARGET_IF` value was not a valid interface name.
+    #[error(transparent)]
+    Interface(#[from] ParseInterfaceNameError),
+    /// A `WOL_PORTS` value was not a valid port list.
+    #[error(transparent)]
+    WolPorts(#[from] WolPortsError),
+    /// A `NAME` value was empty or whitespace-only.
+    #[error(transparent)]
+    ReflectorName(#[from] ParseReflectorNameError),
+    /// A boolean value was not `true`/`false`/`1`/`0`.
+    #[error(transparent)]
+    Bool(#[from] ParseBoolError),
+}
+
+impl RawConfig {
+    /// Overlay environment-derived settings: env globals win, env reflectors are
+    /// added, and a reflector named by both sources is rejected.
+    fn merge_env(&mut self, env: RawConfig) -> Result<(), ConfigError> {
+        self.log_level = env.log_level.or(self.log_level);
+        self.debug_memory = env.debug_memory.or(self.debug_memory);
+        for (name, reflector) in env.reflectors {
+            if self.reflectors.contains_key(&name) {
+                return Err(ConfigError::DuplicateReflector { name });
+            }
+            self.reflectors.insert(name, reflector);
+        }
+        Ok(())
+    }
+}
+
+/// Accumulates a reflector's fields as its `REFLECTOR_<tag>_<param>` variables
+/// are seen, then converts to a [`RawReflector`] once all are consumed.
+#[derive(Debug, Default)]
+struct PartialReflector {
+    name: Option<ReflectorName>,
+    source_if: Option<InterfaceName>,
+    target_if: Option<InterfaceName>,
+    mac: Option<MacAddr>,
+    wol: Option<bool>,
+    mdns: Option<bool>,
+    ssdp: Option<bool>,
+    dial: Option<bool>,
+    wol_ports: Option<WolPorts>,
+    address_family: Option<AddressFamily>,
+}
+
+impl PartialReflector {
+    /// Route one lowercased `param` to its field, parsing `value`. `var` is the
+    /// full variable name, used only to label errors.
+    fn set(&mut self, param: &str, value: &str, var: &str) -> Result<(), ConfigError> {
+        match param {
+            "name" => self.name = Some(env_value(value, var)?),
+            "source_if" => self.source_if = Some(env_value(value, var)?),
+            "target_if" => self.target_if = Some(env_value(value, var)?),
+            "mac" => self.mac = Some(env_value(value, var)?),
+            "wol_ports" => self.wol_ports = Some(env_value(value, var)?),
+            "address_family" => self.address_family = Some(env_value(value, var)?),
+            "wol" => self.wol = Some(env_bool(value, var)?),
+            "mdns" => self.mdns = Some(env_bool(value, var)?),
+            "ssdp" => self.ssdp = Some(env_bool(value, var)?),
+            "dial" => self.dial = Some(env_bool(value, var)?),
+            _ => {
+                return Err(ConfigError::EnvUnknownParam {
+                    var: var.to_owned(),
+                    param: param.to_owned(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Finalize into a [`RawReflector`], requiring the two interface fields.
+    fn into_raw(self, name: &str) -> Result<RawReflector, ConfigError> {
+        Ok(RawReflector {
+            name: self.name,
+            source_if: self.source_if.ok_or_else(|| ConfigError::EnvMissingField {
+                name: name.to_owned(),
+                field: RequiredField::SourceIf,
+            })?,
+            target_if: self.target_if.ok_or_else(|| ConfigError::EnvMissingField {
+                name: name.to_owned(),
+                field: RequiredField::TargetIf,
+            })?,
+            mac: self.mac,
+            wol: self.wol.unwrap_or(false),
+            mdns: self.mdns.unwrap_or(false),
+            ssdp: self.ssdp.unwrap_or(false),
+            dial: self.dial.unwrap_or(false),
+            wol_ports: self.wol_ports,
+            address_family: self.address_family.unwrap_or_default(),
+        })
+    }
+}
+
+/// Parse `REFLECTOR_*` variables into the raw configuration they describe.
+///
+/// `REFLECTOR_LOG_LEVEL` and `REFLECTOR_DEBUG_MEMORY` set the globals; every other
+/// `REFLECTOR_<tag>_<param>` contributes to the reflector keyed by the lowercased
+/// `tag`. Variables without the prefix are ignored.
+fn parse_env(vars: impl IntoIterator<Item = (String, String)>) -> Result<RawConfig, ConfigError> {
+    let mut log_level = None;
+    let mut debug_memory = None;
+    let mut partials: BTreeMap<String, PartialReflector> = BTreeMap::new();
+
+    for (key, value) in vars {
+        let Some(rest) = key.strip_prefix("REFLECTOR_") else {
+            continue;
+        };
+        match rest {
+            "LOG_LEVEL" => {
+                log_level = Some(env_value(&value, &key)?);
+                continue;
+            }
+            "DEBUG_MEMORY" => {
+                debug_memory = Some(env_bool(&value, &key)?);
+                continue;
+            }
+            _ => {}
+        }
+
+        let (tag, param) = rest
+            .split_once('_')
+            .ok_or_else(|| ConfigError::EnvMalformedVar { var: key.clone() })?;
+        if tag.is_empty() || !tag.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            return Err(ConfigError::EnvInvalidTag {
+                var: key.clone(),
+                tag: tag.to_owned(),
+            });
+        }
+        let tag = tag.to_ascii_lowercase();
+        if tag == "log" || tag == "debug" {
+            return Err(ConfigError::EnvReservedTag { var: key.clone() });
+        }
+        partials
+            .entry(tag)
+            .or_default()
+            .set(&param.to_ascii_lowercase(), &value, &key)?;
+    }
+
+    let mut reflectors = BTreeMap::new();
+    for (name, partial) in partials {
+        let raw = partial.into_raw(&name)?;
+        reflectors.insert(name, raw);
+    }
+    Ok(RawConfig {
+        log_level,
+        debug_memory,
+        reflectors,
+    })
+}
+
+/// Parse an environment value through its `FromStr` type, tagging a failure with
+/// the originating variable name.
+fn env_value<T>(value: &str, var: &str) -> Result<T, ConfigError>
+where
+    T: FromStr,
+    T::Err: Into<ParseValueError>,
+{
+    value.parse::<T>().map_err(|e| ConfigError::EnvBadValue {
+        var: var.to_owned(),
+        value: value.to_owned(),
+        source: e.into(),
+    })
+}
+
+/// Parse a boolean environment value (`true`/`false`/`1`/`0`, case-insensitive).
+fn env_bool(value: &str, var: &str) -> Result<bool, ConfigError> {
+    let parsed = match value.to_ascii_lowercase().as_str() {
+        "true" | "1" => true,
+        "false" | "0" => false,
+        _ => {
+            return Err(ConfigError::EnvBadValue {
+                var: var.to_owned(),
+                value: value.to_owned(),
+                source: ParseBoolError.into(),
+            });
+        }
+    };
+    Ok(parsed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -518,7 +858,7 @@ mod tests {
         assert!(!cfg.debug_memory);
         assert_eq!(cfg.reflectors.len(), 1);
         let r = &cfg.reflectors[0];
-        assert_eq!(r.name, "discovery");
+        assert_eq!(r.name.as_str(), "discovery");
         assert_eq!(r.source_if.as_str(), "lan");
         assert_eq!(r.target_if.as_str(), "iot");
         assert!(r.mdns);
@@ -552,7 +892,7 @@ mod tests {
         assert!(cfg.debug_memory);
         assert_eq!(cfg.reflectors.len(), 1);
         let r = &cfg.reflectors[0];
-        assert_eq!(r.name, "tv");
+        assert_eq!(r.name.as_str(), "tv");
         assert_eq!(r.source_if.as_str(), "en0");
         assert_eq!(r.target_if.as_str(), "lo0");
         assert_eq!(r.mac.unwrap().to_string(), "b0:37:95:c5:60:be");
@@ -667,7 +1007,7 @@ mod tests {
             source_if = "a"
             target_if = "b"
         "#;
-        assert!(matches!(err(text), ConfigError::NoProtocol { name } if name == "x"));
+        assert!(matches!(err(text), ConfigError::NoProtocol { name } if name.as_str() == "x"));
     }
 
     #[test]
@@ -869,5 +1209,308 @@ mod tests {
             mdns = true
         "#;
         assert!(matches!(err(text), ConfigError::Parse(_)));
+    }
+
+    // ----- environment layer -----
+
+    fn env(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|&(k, v)| (k.to_owned(), v.to_owned()))
+            .collect()
+    }
+
+    fn from_env(pairs: &[(&str, &str)]) -> Result<Config, ConfigError> {
+        Config::from_sources(None, env(pairs))
+    }
+
+    #[test]
+    fn env_only_minimal_reflector() {
+        let cfg = from_env(&[
+            ("REFLECTOR_TV_SOURCE_IF", "lan"),
+            ("REFLECTOR_TV_TARGET_IF", "iot"),
+            ("REFLECTOR_TV_MDNS", "true"),
+            ("PATH", "/usr/bin"), // non-REFLECTOR vars are ignored
+        ])
+        .unwrap();
+        assert_eq!(cfg.reflectors.len(), 1);
+        let r = &cfg.reflectors[0];
+        assert_eq!(r.name.as_str(), "tv");
+        assert_eq!(r.source_if.as_str(), "lan");
+        assert_eq!(r.target_if.as_str(), "iot");
+        assert!(r.mdns);
+    }
+
+    #[test]
+    fn env_globals_and_bool_forms() {
+        let cfg = from_env(&[
+            ("REFLECTOR_LOG_LEVEL", "debug"),
+            ("REFLECTOR_DEBUG_MEMORY", "1"),
+            ("REFLECTOR_TV_SOURCE_IF", "a"),
+            ("REFLECTOR_TV_TARGET_IF", "b"),
+            ("REFLECTOR_TV_WOL", "1"),
+            ("REFLECTOR_TV_MDNS", "false"),
+        ])
+        .unwrap();
+        assert_eq!(cfg.log_level, LogLevel::Debug);
+        assert!(cfg.debug_memory);
+        let r = &cfg.reflectors[0];
+        assert!(r.wol.is_some());
+        assert!(!r.mdns);
+    }
+
+    #[test]
+    fn env_name_overrides_label_not_key() {
+        let cfg = from_env(&[
+            ("REFLECTOR_TV_SOURCE_IF", "a"),
+            ("REFLECTOR_TV_TARGET_IF", "b"),
+            ("REFLECTOR_TV_MDNS", "true"),
+            ("REFLECTOR_TV_NAME", "Living Room"),
+        ])
+        .unwrap();
+        assert_eq!(cfg.reflectors[0].name.as_str(), "Living Room");
+    }
+
+    #[test]
+    fn env_wol_ports_csv() {
+        let cfg = from_env(&[
+            ("REFLECTOR_TV_SOURCE_IF", "a"),
+            ("REFLECTOR_TV_TARGET_IF", "b"),
+            ("REFLECTOR_TV_WOL", "true"),
+            ("REFLECTOR_TV_WOL_PORTS", "7, 9, 4000"),
+        ])
+        .unwrap();
+        let ports: Vec<u16> = cfg.reflectors[0]
+            .wol
+            .as_ref()
+            .unwrap()
+            .ports
+            .iter()
+            .map(|p| p.get())
+            .collect();
+        assert_eq!(ports, [7, 9, 4000]);
+    }
+
+    #[test]
+    fn env_reuses_cross_field_validation() {
+        let e = from_env(&[
+            ("REFLECTOR_TV_SOURCE_IF", "a"),
+            ("REFLECTOR_TV_TARGET_IF", "a"),
+            ("REFLECTOR_TV_MDNS", "true"),
+        ])
+        .unwrap_err();
+        assert!(matches!(e, ConfigError::SameInterface { value, .. } if value.as_str() == "a"));
+    }
+
+    #[test]
+    fn env_overrides_file_globals() {
+        let toml = r#"
+            log_level = "info"
+            [reflectors.tv]
+            source_if = "a"
+            target_if = "b"
+            mdns = true
+        "#;
+        let cfg =
+            Config::from_sources(Some(toml), env(&[("REFLECTOR_LOG_LEVEL", "error")])).unwrap();
+        assert_eq!(cfg.log_level, LogLevel::Error);
+    }
+
+    #[test]
+    fn env_adds_reflector_alongside_file() {
+        let toml = r#"
+            [reflectors.tv]
+            source_if = "a"
+            target_if = "b"
+            mdns = true
+        "#;
+        let cfg = Config::from_sources(
+            Some(toml),
+            env(&[
+                ("REFLECTOR_RADIO_SOURCE_IF", "c"),
+                ("REFLECTOR_RADIO_TARGET_IF", "d"),
+                ("REFLECTOR_RADIO_MDNS", "true"),
+            ]),
+        )
+        .unwrap();
+        let mut names: Vec<&str> = cfg.reflectors.iter().map(|r| r.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["radio", "tv"]);
+    }
+
+    #[test]
+    fn duplicate_reflector_across_sources_rejected() {
+        let toml = r#"
+            [reflectors.tv]
+            source_if = "a"
+            target_if = "b"
+            mdns = true
+        "#;
+        // Lowercased env tag "TV" collides with file key "tv".
+        let e = Config::from_sources(
+            Some(toml),
+            env(&[
+                ("REFLECTOR_TV_SOURCE_IF", "c"),
+                ("REFLECTOR_TV_TARGET_IF", "d"),
+                ("REFLECTOR_TV_MDNS", "true"),
+            ]),
+        )
+        .unwrap_err();
+        assert!(matches!(e, ConfigError::DuplicateReflector { name } if name == "tv"));
+    }
+
+    #[test]
+    fn env_malformed_var_rejected() {
+        // No underscore to split into <tag>_<param>.
+        assert!(matches!(
+            from_env(&[("REFLECTOR_TV", "x")]).unwrap_err(),
+            ConfigError::EnvMalformedVar { .. }
+        ));
+    }
+
+    #[test]
+    fn env_invalid_tag_rejected() {
+        // Empty tag.
+        assert!(matches!(
+            from_env(&[("REFLECTOR__SOURCE_IF", "x")]).unwrap_err(),
+            ConfigError::EnvInvalidTag { .. }
+        ));
+        // Non-alphanumeric tag.
+        assert!(matches!(
+            from_env(&[("REFLECTOR_T-V_SOURCE_IF", "x")]).unwrap_err(),
+            ConfigError::EnvInvalidTag { tag, .. } if tag == "T-V"
+        ));
+    }
+
+    #[test]
+    fn env_reserved_tag_rejected() {
+        assert!(matches!(
+            from_env(&[("REFLECTOR_LOG_SOMETHING", "x")]).unwrap_err(),
+            ConfigError::EnvReservedTag { .. }
+        ));
+    }
+
+    #[test]
+    fn env_unknown_param_rejected() {
+        assert!(matches!(
+            from_env(&[
+                ("REFLECTOR_TV_SOURCE_IF", "a"),
+                ("REFLECTOR_TV_BOGUS", "1"),
+            ])
+            .unwrap_err(),
+            ConfigError::EnvUnknownParam { param, .. } if param == "bogus"
+        ));
+    }
+
+    #[test]
+    fn env_bad_value_is_structured() {
+        assert!(matches!(
+            from_env(&[
+                ("REFLECTOR_TV_SOURCE_IF", ""),
+                ("REFLECTOR_TV_TARGET_IF", "b"),
+                ("REFLECTOR_TV_MDNS", "true"),
+            ])
+            .unwrap_err(),
+            ConfigError::EnvBadValue {
+                source: ParseValueError::Interface(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            from_env(&[("REFLECTOR_TV_MAC", "zz")]).unwrap_err(),
+            ConfigError::EnvBadValue {
+                source: ParseValueError::Mac(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            from_env(&[("REFLECTOR_TV_WOL", "maybe")]).unwrap_err(),
+            ConfigError::EnvBadValue {
+                value,
+                source: ParseValueError::Bool(_),
+                ..
+            } if value == "maybe"
+        ));
+    }
+
+    #[test]
+    fn env_reflector_missing_required_field() {
+        assert!(matches!(
+            from_env(&[
+                ("REFLECTOR_TV_TARGET_IF", "b"),
+                ("REFLECTOR_TV_MDNS", "true"),
+            ])
+            .unwrap_err(),
+            ConfigError::EnvMissingField {
+                field: RequiredField::SourceIf,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn env_only_no_reflectors_rejected() {
+        assert!(matches!(
+            Config::from_sources(None, env(&[("REFLECTOR_LOG_LEVEL", "info")])).unwrap_err(),
+            ConfigError::NoReflectors
+        ));
+    }
+
+    #[test]
+    fn env_name_is_trimmed() {
+        let cfg = from_env(&[
+            ("REFLECTOR_TV_SOURCE_IF", "a"),
+            ("REFLECTOR_TV_TARGET_IF", "b"),
+            ("REFLECTOR_TV_MDNS", "true"),
+            ("REFLECTOR_TV_NAME", "  Living Room  "),
+        ])
+        .unwrap();
+        assert_eq!(cfg.reflectors[0].name.as_str(), "Living Room");
+    }
+
+    #[test]
+    fn env_whitespace_name_rejected() {
+        assert!(matches!(
+            from_env(&[
+                ("REFLECTOR_TV_SOURCE_IF", "a"),
+                ("REFLECTOR_TV_TARGET_IF", "b"),
+                ("REFLECTOR_TV_MDNS", "true"),
+                ("REFLECTOR_TV_NAME", "   "),
+            ])
+            .unwrap_err(),
+            ConfigError::EnvBadValue {
+                source: ParseValueError::ReflectorName(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn reflector_name_parses_via_fromstr() {
+        assert_eq!("  tv  ".parse::<ReflectorName>().unwrap().as_str(), "tv");
+        assert_eq!("".parse::<ReflectorName>(), Err(ParseReflectorNameError));
+        assert_eq!("   ".parse::<ReflectorName>(), Err(ParseReflectorNameError));
+    }
+
+    #[test]
+    fn empty_file_reflector_key_rejected() {
+        let text = r#"
+            [reflectors.""]
+            source_if = "a"
+            target_if = "b"
+            mdns = true
+        "#;
+        assert!(matches!(err(text), ConfigError::EmptyReflectorName { .. }));
+    }
+
+    #[test]
+    fn whitespace_file_reflector_key_rejected() {
+        let text = r#"
+            [reflectors."   "]
+            source_if = "a"
+            target_if = "b"
+            mdns = true
+        "#;
+        assert!(matches!(err(text), ConfigError::EmptyReflectorName { .. }));
     }
 }

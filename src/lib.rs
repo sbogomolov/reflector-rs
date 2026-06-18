@@ -13,22 +13,18 @@ use config::Config;
 
 /// Run the reflector to completion.
 ///
-/// `args` is the process argument list with argv[0] already stripped. With a
-/// path argument, configuration is loaded from that TOML file.
+/// `args` is the process argument list with argv[0] already stripped. The first
+/// argument, if present, is a TOML config path; `REFLECTOR_*` environment
+/// variables are merged on top (and can configure reflectors on their own).
 ///
 /// # Errors
 /// Returns [`Error`] if configuration loading or validation fails.
 pub fn run(args: &[String]) -> Result<()> {
-    match args.first() {
-        Some(path) => {
-            let config = Config::from_toml_file(path)?;
-            let count = config.reflectors.len();
-            println!(
-                "loaded {count} reflector{}",
-                if count == 1 { "" } else { "s" }
-            );
-        }
-        None => println!("TODO: environment-only configuration (next increment)"),
-    }
+    let config = Config::load(args.first().map(String::as_str), std::env::vars())?;
+    let count = config.reflectors.len();
+    println!(
+        "loaded {count} reflector{}",
+        if count == 1 { "" } else { "s" }
+    );
     Ok(())
 }
