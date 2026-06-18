@@ -1,15 +1,15 @@
 //! Configuration loading and validation.
 //!
-//! TOML is deserialized into a permissive raw form
-//! ([`RawConfig`]/[`RawReflector`]) and then validated into the strongly-typed
-//! [`Config`] the rest of the program uses. The typed values make illegal
-//! states unrepresentable (for example, [`Wol::ports`] exists only when `WoL` is
-//! enabled).
+//! TOML is deserialized into a raw form ([`RawConfig`]/[`RawReflector`]) and then
+//! validated into the strongly-typed [`Config`] the rest of the program uses. The
+//! typed values make illegal states unrepresentable (for example, [`Wol::ports`]
+//! exists only when `WoL` is enabled, and [`InterfaceName`]/[`WolPorts`] can't be
+//! empty).
 //!
-//! Errors split cleanly in two: value-level problems (wrong type, bad port,
-//! unparseable enum/MAC) are produced by the deserializer and surface as
-//! [`ConfigError::Parse`]; cross-field and cross-reflector rules are checked
-//! during validation and surface as their own typed variants.
+//! Each value type is a `FromStr` type with a matching `Deserialize`, so the same
+//! validation serves both the TOML path (via serde, with located errors) and the
+//! upcoming environment path (via `FromStr`, with variable-named errors).
+//! Cross-field and cross-reflector rules live in the `TryFrom` conversions.
 //!
 //! Reflectors are nested under a `reflectors` table (`[reflectors.<name>]`)
 //! rather than top-level tables: this keeps the deserializer off
@@ -19,6 +19,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::num::NonZeroU16;
+use std::ops::Deref;
 use std::str::FromStr;
 
 use serde::{Deserialize, Deserializer};
@@ -156,11 +157,127 @@ impl<'de> Deserialize<'de> for MacAddr {
     }
 }
 
+/// A non-empty network interface name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterfaceName(String);
+
+impl InterfaceName {
+    /// The interface name as a string slice.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for InterfaceName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Error returned when a string is not a valid [`InterfaceName`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error("interface name must not be empty")]
+pub struct ParseInterfaceNameError;
+
+impl FromStr for InterfaceName {
+    type Err = ParseInterfaceNameError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.is_empty() {
+            return Err(ParseInterfaceNameError);
+        }
+        Ok(Self(s.to_owned()))
+    }
+}
+
+impl<'de> Deserialize<'de> for InterfaceName {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+/// A non-empty, duplicate-free list of Wake-on-LAN destination ports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WolPorts(Vec<NonZeroU16>);
+
+impl Default for WolPorts {
+    fn default() -> Self {
+        const PORTS: [NonZeroU16; 2] = [NonZeroU16::new(7).unwrap(), NonZeroU16::new(9).unwrap()];
+        Self(PORTS.to_vec())
+    }
+}
+
+impl Deref for WolPorts {
+    type Target = [NonZeroU16];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+/// Error returned when a string or list is not a valid [`WolPorts`].
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum WolPortsError {
+    /// The list was empty.
+    #[error("wol_ports must not be empty")]
+    Empty,
+    /// The same port appeared more than once.
+    #[error("wol_ports contains duplicate port {0}")]
+    Duplicate(u16),
+    /// A comma-separated token was not a port in 1..=65535.
+    #[error("wol_ports has an invalid port \"{0}\"")]
+    BadPort(String),
+}
+
+impl TryFrom<Vec<NonZeroU16>> for WolPorts {
+    type Error = WolPortsError;
+
+    fn try_from(ports: Vec<NonZeroU16>) -> Result<Self, Self::Error> {
+        if ports.is_empty() {
+            return Err(WolPortsError::Empty);
+        }
+        for (i, port) in ports.iter().enumerate() {
+            if ports[..i].contains(port) {
+                return Err(WolPortsError::Duplicate(port.get()));
+            }
+        }
+        Ok(Self(ports))
+    }
+}
+
+impl FromStr for WolPorts {
+    type Err = WolPortsError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let ports = s
+            .split(',')
+            .map(|token| {
+                let token = token.trim();
+                token
+                    .parse::<NonZeroU16>()
+                    .map_err(|_| WolPortsError::BadPort(token.to_owned()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        WolPorts::try_from(ports)
+    }
+}
+
+impl<'de> Deserialize<'de> for WolPorts {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Vec::<NonZeroU16>::deserialize(deserializer)?
+            .try_into()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
 /// Wake-on-LAN settings (present only when `WoL` is enabled for the reflector).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Wol {
     /// UDP destination ports whose magic packets are relayed.
-    pub ports: Vec<NonZeroU16>,
+    pub ports: WolPorts,
 }
 
 /// SSDP settings (present only when SSDP is enabled for the reflector).
@@ -176,9 +293,9 @@ pub struct Reflector {
     /// Name of the reflector (its key under `[reflectors.<name>]`), used in logs.
     pub name: String,
     /// Interface to listen on.
-    pub source_if: String,
+    pub source_if: InterfaceName,
     /// Interface to emit on (always different from `source_if`).
-    pub target_if: String,
+    pub target_if: InterfaceName,
     /// Optional MAC filter; `None` matches any device.
     pub mac: Option<MacAddr>,
     /// IP-version policy for this reflector.
@@ -252,7 +369,7 @@ pub enum ConfigError {
 
     /// `source_if` and `target_if` were the same interface.
     #[error("reflector \"{name}\" source_if and target_if must differ (both are \"{value}\")")]
-    SameInterface { name: String, value: String },
+    SameInterface { name: String, value: InterfaceName },
 
     /// The reflector enabled none of `WoL`, mDNS, or SSDP.
     #[error("reflector \"{name}\" enables no protocol (set wol, mdns, or ssdp)")]
@@ -288,10 +405,8 @@ struct RawConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawReflector {
-    #[serde(deserialize_with = "de_interface")]
-    source_if: String,
-    #[serde(deserialize_with = "de_interface")]
-    target_if: String,
+    source_if: InterfaceName,
+    target_if: InterfaceName,
     mac: Option<MacAddr>,
     #[serde(default)]
     wol: bool,
@@ -301,8 +416,7 @@ struct RawReflector {
     ssdp: bool,
     #[serde(default)]
     dial: bool,
-    #[serde(default, deserialize_with = "de_wol_ports")]
-    wol_ports: Option<Vec<NonZeroU16>>,
+    wol_ports: Option<WolPorts>,
     #[serde(default)]
     address_family: AddressFamily,
 }
@@ -315,7 +429,7 @@ impl TryFrom<RawConfig> for Config {
     fn try_from(raw: RawConfig) -> Result<Self, ConfigError> {
         let mut reflectors = Vec::with_capacity(raw.reflectors.len());
         for (name, raw_reflector) in raw.reflectors {
-            reflectors.push(Reflector::from_raw(name, raw_reflector)?);
+            reflectors.push(Reflector::try_from((name, raw_reflector))?);
         }
         if reflectors.is_empty() {
             return Err(ConfigError::NoReflectors);
@@ -329,8 +443,10 @@ impl TryFrom<RawConfig> for Config {
     }
 }
 
-impl Reflector {
-    fn from_raw(name: String, raw: RawReflector) -> Result<Self, ConfigError> {
+impl TryFrom<(String, RawReflector)> for Reflector {
+    type Error = ConfigError;
+
+    fn try_from((name, raw): (String, RawReflector)) -> Result<Self, ConfigError> {
         let source_if = raw.source_if;
         let target_if = raw.target_if;
         if source_if == target_if {
@@ -351,7 +467,7 @@ impl Reflector {
         }
 
         let wol = if raw.wol {
-            let ports = raw.wol_ports.unwrap_or_else(default_wol_ports);
+            let ports = raw.wol_ports.unwrap_or_default();
             Some(Wol { ports })
         } else {
             None
@@ -379,39 +495,6 @@ impl Reflector {
     }
 }
 
-// ----- helpers -------------------------------------------------------------
-
-fn de_interface<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
-    let value = String::deserialize(deserializer)?;
-    if value.is_empty() {
-        return Err(serde::de::Error::custom("interface name must not be empty"));
-    }
-    Ok(value)
-}
-
-fn de_wol_ports<'de, D: Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Option<Vec<NonZeroU16>>, D::Error> {
-    let ports = Vec::<NonZeroU16>::deserialize(deserializer)?;
-    if ports.is_empty() {
-        return Err(serde::de::Error::custom("wol_ports must not be empty"));
-    }
-    for (i, port) in ports.iter().enumerate() {
-        if ports[..i].contains(port) {
-            return Err(serde::de::Error::custom(format!(
-                "wol_ports contains duplicate port {}",
-                port.get()
-            )));
-        }
-    }
-    Ok(Some(ports))
-}
-
-fn default_wol_ports() -> Vec<NonZeroU16> {
-    const PORTS: [NonZeroU16; 2] = [NonZeroU16::new(7).unwrap(), NonZeroU16::new(9).unwrap()];
-    PORTS.to_vec()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -436,8 +519,8 @@ mod tests {
         assert_eq!(cfg.reflectors.len(), 1);
         let r = &cfg.reflectors[0];
         assert_eq!(r.name, "discovery");
-        assert_eq!(r.source_if, "lan");
-        assert_eq!(r.target_if, "iot");
+        assert_eq!(r.source_if.as_str(), "lan");
+        assert_eq!(r.target_if.as_str(), "iot");
         assert!(r.mdns);
         assert!(r.mac.is_none());
         assert_eq!(r.address_family, AddressFamily::Default);
@@ -470,8 +553,8 @@ mod tests {
         assert_eq!(cfg.reflectors.len(), 1);
         let r = &cfg.reflectors[0];
         assert_eq!(r.name, "tv");
-        assert_eq!(r.source_if, "en0");
-        assert_eq!(r.target_if, "lo0");
+        assert_eq!(r.source_if.as_str(), "en0");
+        assert_eq!(r.target_if.as_str(), "lo0");
         assert_eq!(r.mac.unwrap().to_string(), "b0:37:95:c5:60:be");
         let wol = r.wol.as_ref().unwrap();
         assert!(r.mdns);
@@ -545,6 +628,22 @@ mod tests {
     }
 
     #[test]
+    fn interface_name_parses_via_fromstr() {
+        assert_eq!("en0".parse::<InterfaceName>().unwrap().as_str(), "en0");
+        assert_eq!("".parse::<InterfaceName>(), Err(ParseInterfaceNameError));
+    }
+
+    #[test]
+    fn wol_ports_parse_via_fromstr() {
+        let ports = "7, 9, 4000".parse::<WolPorts>().unwrap();
+        assert_eq!(ports.iter().map(|p| p.get()).collect::<Vec<_>>(), [7, 9, 4000]);
+        assert!(matches!("7,7".parse::<WolPorts>(), Err(WolPortsError::Duplicate(7))));
+        assert!(matches!("0".parse::<WolPorts>(), Err(WolPortsError::BadPort(_))));
+        assert!(matches!("abc".parse::<WolPorts>(), Err(WolPortsError::BadPort(_))));
+        assert_eq!(WolPorts::default().iter().map(|p| p.get()).collect::<Vec<_>>(), [7, 9]);
+    }
+
+    #[test]
     fn empty_config_is_rejected() {
         assert!(matches!(err(""), ConfigError::NoReflectors));
     }
@@ -579,7 +678,9 @@ mod tests {
             target_if = "same"
             mdns = true
         "#;
-        assert!(matches!(err(text), ConfigError::SameInterface { value, .. } if value == "same"));
+        assert!(
+            matches!(err(text), ConfigError::SameInterface { value, .. } if value.as_str() == "same")
+        );
     }
 
     #[test]
