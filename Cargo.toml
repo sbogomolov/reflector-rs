@@ -6,3 +6,5 @@ rust-version = "1.93"
 
 [dependencies]
 thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+toml = "1"

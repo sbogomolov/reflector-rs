@@ -4,20 +4,28 @@
 //! The behavior lives in this library crate so it stays testable in-process;
 //! the binary (`src/main.rs`) is a thin shim over [`run`].
 
+pub mod config;
 mod error;
 
 pub use error::{Error, Result};
 
+use config::Config;
+
 /// Run the reflector to completion.
 ///
 /// `args` is the process argument list with argv[0] already stripped. With a
-/// path argument the configuration is read from that TOML file and merged with
-/// `REFLECTOR_*` environment variables; with no argument it comes entirely
-/// from the environment.
+/// path argument, configuration is loaded from that TOML file.
 pub fn run(args: &[String]) -> Result<()> {
     match args.first() {
-        Some(path) => println!("TODO: load config from {path} (+ REFLECTOR_* env)"),
-        None => println!("TODO: load config from environment only"),
+        Some(path) => {
+            let config = Config::from_toml_file(path)?;
+            let count = config.reflectors.len();
+            println!(
+                "loaded {count} reflector{}",
+                if count == 1 { "" } else { "s" }
+            );
+        }
+        None => println!("TODO: environment-only configuration (next increment)"),
     }
     Ok(())
 }
