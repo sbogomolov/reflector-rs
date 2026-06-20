@@ -20,6 +20,26 @@ pub struct Key {
     generation: u32,
 }
 
+impl Key {
+    /// Pack the key into a `u64`, recoverable losslessly via
+    /// [`from_u64`](Key::from_u64). The two `u32` halves fit exactly, which lets
+    /// the key ride in an opaque 64-bit slot (such as a kernel readiness token).
+    #[must_use]
+    pub fn to_u64(self) -> u64 {
+        (u64::from(self.index) << 32) | u64::from(self.generation)
+    }
+
+    /// Reconstruct a key packed by [`to_u64`](Key::to_u64).
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn from_u64(packed: u64) -> Self {
+        Self {
+            index: (packed >> 32) as u32,
+            generation: packed as u32,
+        }
+    }
+}
+
 /// One arena slot: occupied (`Some`) or free (`None`), plus the generation that
 /// keys must match to address the current occupant.
 struct Slot<T> {
@@ -210,5 +230,33 @@ mod tests {
         // Both name the same slot: a mutation through one is seen through the other.
         *arena.get_mut(copy).unwrap() = "updated";
         assert_eq!(arena.get(key), Some(&"updated"));
+    }
+
+    #[test]
+    fn key_u64_round_trips() {
+        for key in [
+            Key {
+                index: 0,
+                generation: 0,
+            },
+            Key {
+                index: 1,
+                generation: 2,
+            },
+            Key {
+                index: u32::MAX,
+                generation: 0,
+            },
+            Key {
+                index: 0,
+                generation: u32::MAX,
+            },
+            Key {
+                index: u32::MAX,
+                generation: u32::MAX,
+            },
+        ] {
+            assert_eq!(Key::from_u64(key.to_u64()), key);
+        }
     }
 }
