@@ -18,7 +18,6 @@ const ETHERNET_HEADER_SIZE: usize = 14; // dst MAC(6) + src MAC(6) + ethertype(2
 const IPV4_HEADER_SIZE: usize = 20;
 const IPV6_HEADER_SIZE: usize = 40;
 const UDP_HEADER_SIZE: usize = 8;
-const IP_PROTO_UDP: u8 = 17;
 const IPV4_ETHERTYPE: u16 = 0x0800;
 const IPV6_ETHERTYPE: u16 = 0x86dd;
 /// Don't-Fragment, in the IPv4 flags + fragment-offset field. These one-hop
@@ -108,7 +107,7 @@ fn ipv4_udp(
     out[2..4].copy_from_slice(&total_length.to_be_bytes());
     out[6..8].copy_from_slice(&IPV4_FLAG_DF.to_be_bytes());
     out[8] = ttl;
-    out[9] = IP_PROTO_UDP;
+    out[9] = super::IP_PROTO_UDP;
     out[12..16].copy_from_slice(&src.ip().octets());
     out[16..20].copy_from_slice(&dst.ip().octets());
     let ip_checksum = checksum::ipv4_header(&out[..IPV4_HEADER_SIZE]);
@@ -142,7 +141,7 @@ fn ipv6_udp(
 
     out[0] = 0x60; // version 6, zero traffic class / flow label
     out[4..6].copy_from_slice(&udp_length.to_be_bytes()); // payload length
-    out[6] = IP_PROTO_UDP; // next header
+    out[6] = super::IP_PROTO_UDP; // next header
     out[7] = hop_limit;
     out[8..24].copy_from_slice(&src.ip().octets());
     out[24..40].copy_from_slice(&dst.ip().octets());
@@ -240,7 +239,7 @@ mod tests {
         assert_eq!(&frame[4..6], [0u8, 0].as_slice()); // identification
         assert_eq!(u16::from_be_bytes([frame[6], frame[7]]), IPV4_FLAG_DF); // flags + fragment
         assert_eq!(frame[8], 1); // ttl
-        assert_eq!(frame[9], IP_PROTO_UDP);
+        assert_eq!(frame[9], crate::net::IP_PROTO_UDP);
         assert_eq!(
             u16::from_be_bytes([frame[10], frame[11]]),
             checksum::ipv4_header(&frame[..IPV4_HEADER_SIZE])
@@ -284,7 +283,7 @@ mod tests {
             u16::from_be_bytes([frame[4], frame[5]]),
             u16::try_from(UDP_HEADER_SIZE + payload.len()).unwrap()
         ); // payload length
-        assert_eq!(frame[6], IP_PROTO_UDP); // next header
+        assert_eq!(frame[6], crate::net::IP_PROTO_UDP); // next header
         assert_eq!(frame[7], 255); // hop limit
         assert_eq!(&frame[8..24], src.ip().octets().as_slice());
         assert_eq!(&frame[24..40], dst.ip().octets().as_slice());

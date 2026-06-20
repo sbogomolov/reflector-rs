@@ -6,9 +6,6 @@
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-/// IANA protocol number for UDP, as it appears in the UDP pseudo-header.
-const UDP: u8 = 17;
-
 /// Internet checksum of an IPv4 header.
 ///
 /// `header` is the full IHL-sized header. Its own checksum field (bytes 10-11)
@@ -40,7 +37,7 @@ pub fn udp_v4(src: Ipv4Addr, dst: Ipv4Addr, udp: &[u8]) -> u16 {
     let mut pseudo = [0u8; 12];
     pseudo[0..4].copy_from_slice(&src.octets());
     pseudo[4..8].copy_from_slice(&dst.octets());
-    pseudo[9] = UDP;
+    pseudo[9] = super::IP_PROTO_UDP;
     pseudo[10..12].copy_from_slice(&udp_length(udp).to_be_bytes());
     udp_checksum(&pseudo, udp)
 }
@@ -60,7 +57,7 @@ pub fn udp_v6(src: Ipv6Addr, dst: Ipv6Addr, udp: &[u8]) -> u16 {
     pseudo[0..16].copy_from_slice(&src.octets());
     pseudo[16..32].copy_from_slice(&dst.octets());
     pseudo[32..36].copy_from_slice(&u32::from(udp_length(udp)).to_be_bytes());
-    pseudo[39] = UDP;
+    pseudo[39] = super::IP_PROTO_UDP;
     udp_checksum(&pseudo, udp)
 }
 
