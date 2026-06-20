@@ -4,9 +4,10 @@
 //! The behavior lives in this library crate so it stays testable in-process;
 //! the binary (`src/main.rs`) is a thin shim over [`run`].
 
-pub mod checksum;
+mod checksum;
 pub mod config;
 mod error;
+pub mod frame;
 mod logging;
 pub mod reactor;
 
