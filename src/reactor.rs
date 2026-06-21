@@ -20,6 +20,7 @@
 
 mod arena;
 mod poll;
+mod signal;
 
 pub(crate) use self::arena::Key;
 
@@ -73,6 +74,7 @@ struct Registration {
 pub(crate) struct Reactor {
     registrations: Arena<Registration>,
     poll: Poller,
+    shutdown: bool,
 }
 
 impl Reactor {
@@ -84,6 +86,7 @@ impl Reactor {
         Ok(Self {
             registrations: Arena::new(),
             poll: Poller::new(EVENT_CAPACITY)?,
+            shutdown: false,
         })
     }
 
@@ -172,6 +175,40 @@ impl Reactor {
             self.dispatch(event.key, event.readiness);
         }
         Ok(())
+    }
+
+    /// Run until a shutdown signal (SIGINT/SIGTERM) arrives, dispatching readiness
+    /// in between. A self-pipe shutdown handler is installed for the duration and
+    /// the previous signal dispositions are restored before returning.
+    ///
+    /// # Errors
+    /// Returns an error if the shutdown handler cannot be installed or a wait fails.
+    pub(crate) fn run(&mut self) -> io::Result<()> {
+        let (shutdown, read) = signal::ShutdownPipe::install()?;
+        let key = self.register(read, Box::new(signal::SignalPipe))?;
+        self.shutdown = false;
+        let result = self.run_loop();
+        // Restore the signal handlers and unpublish the write fd *before* closing
+        // the read end, so a late signal can't write to a reader-less pipe.
+        drop(shutdown);
+        self.unregister(key).ok();
+        result
+    }
+
+    /// Dispatch readiness until [`request_shutdown`](Self::request_shutdown) is
+    /// called. Blocks in each wait, so it idles at zero cost between events.
+    fn run_loop(&mut self) -> io::Result<()> {
+        while !self.shutdown {
+            self.poll_once(None)?;
+        }
+        Ok(())
+    }
+
+    /// Ask the run loop to stop once the current dispatch returns. Handlers call
+    /// this (the self-pipe handler does, on a shutdown signal); calling it outside
+    /// a run loop just arms the next one to exit immediately.
+    pub(crate) fn request_shutdown(&mut self) {
+        self.shutdown = true;
     }
 
     /// Deliver `readiness` to the registration `key` addresses — the seam
@@ -519,5 +556,18 @@ mod tests {
         (&peer).write_all(b"x").unwrap();
         reactor.poll_once(Some(short())).unwrap();
         assert!(fired.get());
+    }
+
+    #[test]
+    fn run_loop_stops_when_a_handler_requests_shutdown() {
+        let mut reactor = Reactor::new().unwrap();
+        let (a, peer) = pair();
+        reactor
+            .register(a, TestHandler::read(|_, r| r.request_shutdown()))
+            .unwrap();
+        // Readable before looping, so the first (blocking) wait returns at once.
+        (&peer).write_all(b"x").unwrap();
+        reactor.run_loop().unwrap();
+        assert!(reactor.shutdown);
     }
 }
