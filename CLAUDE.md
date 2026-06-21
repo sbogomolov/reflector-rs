@@ -12,5 +12,9 @@
 ## Build / test
 - Keep `cargo clippy --all-targets -- -D warnings` clean.
 - Keep `cargo fmt --check` clean (run `cargo fmt` to fix).
+- Platform `cfg` code (the epoll backend now, AF_PACKET capture later) isn't built
+  on the macOS dev host — verify it on Linux with `./docker_test.sh` (forwards to
+  cargo, e.g. `./docker_test.sh clippy --all-targets -- -D warnings`). Check both
+  host and Linux when touching `cfg(target_os)` code.
 - `cargo run` — no path arg: config from env only; with a path arg: TOML merged
   with `REFLECTOR_*` env.
