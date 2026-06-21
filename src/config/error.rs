@@ -20,7 +20,7 @@ use crate::net::mac::ParseMacAddrError;
 /// (wrong type, bad port, unparseable enum/MAC); the remaining variants are the
 /// cross-field and cross-reflector rules the deserializer cannot express.
 #[derive(Debug, Error)]
-pub enum ConfigError {
+pub(crate) enum ConfigError {
     /// The text was not valid TOML, or a value had the wrong type/range.
     #[error("invalid configuration: {0}")]
     Parse(#[from] toml::de::Error),
@@ -114,7 +114,7 @@ pub enum ConfigError {
 
 /// A required reflector field, named in [`ConfigError::EnvMissingField`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RequiredField {
+pub(crate) enum RequiredField {
     /// The listen interface (`source_if`).
     SourceIf,
     /// The emit interface (`target_if`).
@@ -132,7 +132,7 @@ impl fmt::Display for RequiredField {
 
 /// A reflected discovery protocol, named in [`ConfigError::ConflictingReflectors`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Protocol {
+pub(crate) enum Protocol {
     /// Wake-on-LAN.
     Wol,
     /// Multicast DNS.
@@ -156,7 +156,7 @@ impl fmt::Display for Protocol {
 /// Aggregating the per-type errors keeps [`ConfigError::EnvBadValue`] structured
 /// (matchable in tests) while still attaching the originating variable name.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
-pub enum ParseValueError {
+pub(crate) enum ParseValueError {
     /// A `LOG_LEVEL` value was not a valid log level.
     #[error(transparent)]
     LogLevel(#[from] ParseLogLevelError),
@@ -183,4 +183,4 @@ pub enum ParseValueError {
 /// Error returned when a string is not a recognized boolean.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 #[error("expected true, false, 1, or 0")]
-pub struct ParseBoolError;
+pub(crate) struct ParseBoolError;

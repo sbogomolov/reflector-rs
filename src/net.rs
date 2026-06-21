@@ -3,8 +3,8 @@
 //! come.
 
 mod checksum;
-pub mod frame;
-pub mod mac;
+pub(crate) mod frame;
+pub(crate) mod mac;
 
 /// IANA protocol number for UDP.
 const IP_PROTO_UDP: u8 = 17;

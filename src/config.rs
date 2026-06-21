@@ -24,11 +24,8 @@ mod error;
 mod raw;
 mod value;
 
-pub use self::error::{ConfigError, ParseBoolError, ParseValueError, Protocol, RequiredField};
-pub use self::value::{
-    AddressFamily, InterfaceName, LogLevel, ParseAddressFamilyError, ParseInterfaceNameError,
-    ParseLogLevelError, ParseReflectorNameError, ReflectorName, WolPorts, WolPortsError,
-};
+pub(crate) use self::error::{ConfigError, Protocol};
+pub(crate) use self::value::{AddressFamily, InterfaceName, LogLevel, ReflectorName, WolPorts};
 
 use std::str::FromStr;
 
@@ -39,63 +36,52 @@ use crate::net::mac::MacAddr;
 
 /// Wake-on-LAN settings (present only when `WoL` is enabled for the reflector).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Wol {
+pub(crate) struct Wol {
     /// UDP destination ports whose magic packets are relayed.
-    pub ports: WolPorts,
+    pub(crate) ports: WolPorts,
 }
 
 /// SSDP settings (present only when SSDP is enabled for the reflector).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Ssdp {
+pub(crate) struct Ssdp {
     /// Whether the DIAL HTTP proxy is layered on top of SSDP.
-    pub dial: bool,
+    pub(crate) dial: bool,
 }
 
 /// One reflector: bridges `source_if` → `target_if` for the enabled protocols.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Reflector {
+pub(crate) struct Reflector {
     /// Display name (from the `[reflectors.<name>]` key or `REFLECTOR_<tag>_NAME`),
     /// used in logs; trimmed and never empty.
-    pub name: ReflectorName,
+    pub(crate) name: ReflectorName,
     /// Interface to listen on.
-    pub source_if: InterfaceName,
+    pub(crate) source_if: InterfaceName,
     /// Interface to emit on (always different from `source_if`).
-    pub target_if: InterfaceName,
+    pub(crate) target_if: InterfaceName,
     /// Optional MAC filter; `None` matches any device.
-    pub mac: Option<MacAddr>,
+    pub(crate) mac: Option<MacAddr>,
     /// IP-version policy for this reflector.
-    pub address_family: AddressFamily,
+    pub(crate) address_family: AddressFamily,
     /// Wake-on-LAN settings, or `None` when `WoL` is disabled.
-    pub wol: Option<Wol>,
+    pub(crate) wol: Option<Wol>,
     /// Whether mDNS reflection is enabled.
-    pub mdns: bool,
+    pub(crate) mdns: bool,
     /// SSDP settings, or `None` when SSDP is disabled.
-    pub ssdp: Option<Ssdp>,
+    pub(crate) ssdp: Option<Ssdp>,
 }
 
 /// A fully-validated configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Config {
+pub(crate) struct Config {
     /// Minimum severity to log.
-    pub log_level: LogLevel,
+    pub(crate) log_level: LogLevel,
     /// Whether to periodically log memory-footprint diagnostics.
-    pub debug_memory: bool,
+    pub(crate) debug_memory: bool,
     /// The configured reflectors.
-    pub reflectors: Vec<Reflector>,
+    pub(crate) reflectors: Vec<Reflector>,
 }
 
 impl Config {
-    /// Parse and validate a configuration from TOML text.
-    ///
-    /// # Errors
-    /// Returns [`ConfigError::Parse`] for malformed TOML or out-of-range values,
-    /// or a cross-field [`ConfigError`] variant if validation fails.
-    pub fn from_toml_str(text: &str) -> Result<Self, ConfigError> {
-        // First `?`: value-level errors (serde). Second call: cross-field rules.
-        let raw: RawConfig = toml::from_str(text)?;
-        Config::try_from(raw)
-    }
-
     /// Build a configuration from optional TOML text plus environment variables.
     ///
     /// Environment variables take precedence over the file for the global
@@ -106,7 +92,7 @@ impl Config {
     /// Returns [`ConfigError::Parse`] for malformed TOML, an `Env*` variant for a
     /// malformed or invalid environment variable, [`ConfigError::DuplicateReflector`]
     /// when a name is defined by both sources, or any cross-field [`ConfigError`].
-    pub fn from_sources(
+    pub(crate) fn from_sources(
         toml_text: Option<&str>,
         env: impl IntoIterator<Item = (String, String)>,
     ) -> Result<Self, ConfigError> {
@@ -339,13 +325,17 @@ fn check_conflicts(reflectors: &[Reflector]) -> Result<(), ConfigError> {
 mod tests {
     use super::*;
 
+    fn from_toml(text: &str) -> Result<Config, ConfigError> {
+        Config::from_sources(Some(text), Vec::<(String, String)>::new())
+    }
+
     fn err(text: &str) -> ConfigError {
-        Config::from_toml_str(text).unwrap_err()
+        from_toml(text).unwrap_err()
     }
 
     #[test]
     fn minimal_reflector_uses_defaults() {
-        let cfg = Config::from_toml_str(
+        let cfg = from_toml(
             r#"
             [reflectors.discovery]
             source_if = "lan"
@@ -370,7 +360,7 @@ mod tests {
 
     #[test]
     fn full_reflector_parses() {
-        let cfg = Config::from_toml_str(
+        let cfg = from_toml(
             r#"
             log_level = "DEBUG"
             debug_memory = true
@@ -409,7 +399,7 @@ mod tests {
 
     #[test]
     fn wol_defaults_to_ports_7_and_9() {
-        let cfg = Config::from_toml_str(
+        let cfg = from_toml(
             r#"
             [reflectors.w]
             source_if = "a"
@@ -431,7 +421,7 @@ mod tests {
 
     #[test]
     fn multiple_reflectors_parse() {
-        let cfg = Config::from_toml_str(
+        let cfg = from_toml(
             r#"
             [reflectors.zebra]
             source_if = "a"
@@ -736,7 +726,7 @@ mod tests {
             target_if = "lan"
             mdns = true
         "#;
-        assert!(Config::from_toml_str(text).is_ok());
+        assert!(from_toml(text).is_ok());
     }
 
     #[test]
@@ -752,7 +742,7 @@ mod tests {
             target_if = "iot"
             wol = true
         "#;
-        assert!(Config::from_toml_str(text).is_ok());
+        assert!(from_toml(text).is_ok());
     }
 
     #[test]
@@ -770,7 +760,7 @@ mod tests {
             mdns = true
             mac = "00:00:00:00:00:02"
         "#;
-        assert!(Config::from_toml_str(text).is_ok());
+        assert!(from_toml(text).is_ok());
     }
 
     #[test]
@@ -812,7 +802,7 @@ mod tests {
             mdns = true
             address_family = "ipv6"
         "#;
-        assert!(Config::from_toml_str(text).is_ok());
+        assert!(from_toml(text).is_ok());
     }
 
     #[test]
@@ -854,6 +844,6 @@ mod tests {
             wol = true
             wol_ports = [4000]
         "#;
-        assert!(Config::from_toml_str(text).is_ok());
+        assert!(from_toml(text).is_ok());
     }
 }

@@ -27,7 +27,7 @@ const IPV4_FLAG_DF: u16 = 0x4000;
 
 /// Why building a UDP frame failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
-pub enum FrameError {
+pub(crate) enum FrameError {
     /// `out` cannot hold the frame.
     #[error("output buffer too small: need {needed} bytes, have {available}")]
     BufferTooSmall { needed: usize, available: usize },
@@ -43,7 +43,7 @@ pub enum FrameError {
 /// # Errors
 /// [`FrameError::PayloadTooLarge`] if the datagram overflows the 16-bit length
 /// fields, or [`FrameError::BufferTooSmall`] if `out` cannot hold the frame.
-pub fn ethernet_ipv4_udp(
+pub(crate) fn ethernet_ipv4_udp(
     dst_mac: MacAddr,
     src_mac: MacAddr,
     src: SocketAddrV4,
@@ -66,7 +66,7 @@ pub fn ethernet_ipv4_udp(
 /// # Errors
 /// [`FrameError::PayloadTooLarge`] if the datagram overflows the 16-bit length
 /// fields, or [`FrameError::BufferTooSmall`] if `out` cannot hold the frame.
-pub fn ethernet_ipv6_udp(
+pub(crate) fn ethernet_ipv6_udp(
     dst_mac: MacAddr,
     src_mac: MacAddr,
     src: SocketAddrV6,

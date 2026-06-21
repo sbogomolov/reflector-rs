@@ -40,7 +40,7 @@ pub fn init() {
 
 /// Set the minimum severity that will be logged. Cheap and idempotent — the
 /// library calls this once the configured level is known.
-pub fn set_level(level: LogLevel) {
+pub(crate) fn set_level(level: LogLevel) {
     log::set_max_level(LevelFilter::from(level));
 }
 

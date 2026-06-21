@@ -16,7 +16,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 /// # Panics
 /// Panics if `header` is shorter than 12 bytes (no room for the checksum field).
 #[must_use]
-pub fn ipv4_header(header: &[u8]) -> u16 {
+pub(crate) fn ipv4_header(header: &[u8]) -> u16 {
     // Sum the header with its checksum field (bytes 10-11) skipped.
     let sum = sum_words(&header[..10], 0);
     let sum = sum_words(&header[12..], sum);
@@ -32,7 +32,7 @@ pub fn ipv4_header(header: &[u8]) -> u16 {
 /// # Panics
 /// Panics if `udp` is shorter than the 8-byte UDP header.
 #[must_use]
-pub fn udp_v4(src: Ipv4Addr, dst: Ipv4Addr, udp: &[u8]) -> u16 {
+pub(crate) fn udp_v4(src: Ipv4Addr, dst: Ipv4Addr, udp: &[u8]) -> u16 {
     // Pseudo-header: src(4) dst(4) zero(1) protocol(1) length(2).
     let mut pseudo = [0u8; 12];
     pseudo[0..4].copy_from_slice(&src.octets());
@@ -51,7 +51,7 @@ pub fn udp_v4(src: Ipv4Addr, dst: Ipv4Addr, udp: &[u8]) -> u16 {
 /// # Panics
 /// Panics if `udp` is shorter than the 8-byte UDP header.
 #[must_use]
-pub fn udp_v6(src: Ipv6Addr, dst: Ipv6Addr, udp: &[u8]) -> u16 {
+pub(crate) fn udp_v6(src: Ipv6Addr, dst: Ipv6Addr, udp: &[u8]) -> u16 {
     // Pseudo-header: src(16) dst(16) length(4) zero(3) next_header(1).
     let mut pseudo = [0u8; 40];
     pseudo[0..16].copy_from_slice(&src.octets());

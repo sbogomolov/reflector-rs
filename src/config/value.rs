@@ -16,7 +16,7 @@ use thiserror::Error;
 /// Minimum severity a record must have to be logged; `Off` disables logging
 /// entirely. Ordered most-restrictive to most-verbose, mirroring `log`'s filter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum LogLevel {
+pub(crate) enum LogLevel {
     Off,
     Error,
     Warning,
@@ -29,7 +29,7 @@ pub enum LogLevel {
 /// Error returned when a string is not a valid [`LogLevel`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 #[error("expected one of: off, error, warning, info, debug, trace")]
-pub struct ParseLogLevelError;
+pub(crate) struct ParseLogLevelError;
 
 impl FromStr for LogLevel {
     type Err = ParseLogLevelError;
@@ -57,7 +57,7 @@ impl<'de> Deserialize<'de> for LogLevel {
 
 /// Which IP versions a reflector operates on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum AddressFamily {
+pub(crate) enum AddressFamily {
     #[default]
     Default,
     Dual,
@@ -68,13 +68,13 @@ pub enum AddressFamily {
 impl AddressFamily {
     /// Whether this family handles IPv4 traffic.
     #[must_use]
-    pub fn uses_ipv4(self) -> bool {
+    pub(crate) fn uses_ipv4(self) -> bool {
         matches!(self, Self::Default | Self::Dual | Self::Ipv4)
     }
 
     /// Whether this family handles IPv6 traffic.
     #[must_use]
-    pub fn uses_ipv6(self) -> bool {
+    pub(crate) fn uses_ipv6(self) -> bool {
         matches!(self, Self::Default | Self::Dual | Self::Ipv6)
     }
 }
@@ -82,7 +82,7 @@ impl AddressFamily {
 /// Error returned when a string is not a valid [`AddressFamily`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 #[error("expected one of: default, dual, ipv4, ipv6")]
-pub struct ParseAddressFamilyError;
+pub(crate) struct ParseAddressFamilyError;
 
 impl FromStr for AddressFamily {
     type Err = ParseAddressFamilyError;
@@ -108,12 +108,14 @@ impl<'de> Deserialize<'de> for AddressFamily {
 
 /// A non-empty network interface name.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InterfaceName(String);
+pub(crate) struct InterfaceName(String);
 
 impl InterfaceName {
     /// The interface name as a string slice.
+    // Used by tests; the capture layer reads it to bind sockets to the interface.
+    #[allow(dead_code)]
     #[must_use]
-    pub fn as_str(&self) -> &str {
+    pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
 }
@@ -127,7 +129,7 @@ impl fmt::Display for InterfaceName {
 /// Error returned when a string is not a valid [`InterfaceName`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 #[error("interface name must not be empty")]
-pub struct ParseInterfaceNameError;
+pub(crate) struct ParseInterfaceNameError;
 
 impl FromStr for InterfaceName {
     type Err = ParseInterfaceNameError;
@@ -150,12 +152,14 @@ impl<'de> Deserialize<'de> for InterfaceName {
 
 /// A reflector's display name: surrounding whitespace trimmed, never empty.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReflectorName(String);
+pub(crate) struct ReflectorName(String);
 
 impl ReflectorName {
     /// The name as a string slice.
+    // Used by tests; kept as the name's read accessor for the reflector layer.
+    #[allow(dead_code)]
     #[must_use]
-    pub fn as_str(&self) -> &str {
+    pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
 }
@@ -169,7 +173,7 @@ impl fmt::Display for ReflectorName {
 /// Error returned when a string is not a valid [`ReflectorName`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 #[error("reflector name must not be empty or whitespace-only")]
-pub struct ParseReflectorNameError;
+pub(crate) struct ParseReflectorNameError;
 
 impl FromStr for ReflectorName {
     type Err = ParseReflectorNameError;
@@ -185,7 +189,7 @@ impl FromStr for ReflectorName {
 
 /// A non-empty, duplicate-free list of Wake-on-LAN destination ports.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WolPorts(Vec<NonZeroU16>);
+pub(crate) struct WolPorts(Vec<NonZeroU16>);
 
 impl Default for WolPorts {
     fn default() -> Self {
@@ -204,7 +208,7 @@ impl Deref for WolPorts {
 
 /// Error returned when a string or list is not a valid [`WolPorts`].
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
-pub enum WolPortsError {
+pub(crate) enum WolPortsError {
     /// The list was empty.
     #[error("wol_ports must not be empty")]
     Empty,

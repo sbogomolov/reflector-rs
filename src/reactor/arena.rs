@@ -15,7 +15,7 @@
 /// Valid only for the value it was returned for; once that value is removed the
 /// key is stale and every lookup with it returns `None`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Key {
+pub(crate) struct Key {
     index: u32,
     generation: u32,
 }
@@ -25,14 +25,14 @@ impl Key {
     /// [`from_u64`](Key::from_u64). The two `u32` halves fit exactly, which lets
     /// the key ride in an opaque 64-bit slot (such as a kernel readiness token).
     #[must_use]
-    pub fn to_u64(self) -> u64 {
+    pub(crate) fn to_u64(self) -> u64 {
         (u64::from(self.index) << 32) | u64::from(self.generation)
     }
 
     /// Reconstruct a key packed by [`to_u64`](Key::to_u64).
     #[must_use]
     #[allow(clippy::cast_possible_truncation)]
-    pub fn from_u64(packed: u64) -> Self {
+    pub(crate) fn from_u64(packed: u64) -> Self {
         Self {
             index: (packed >> 32) as u32,
             generation: packed as u32,
@@ -49,7 +49,7 @@ struct Slot<T> {
 
 /// A slab of slots addressed by generational [`Key`]s, with a free list so freed
 /// slots are reused without invalidating live keys to other slots.
-pub struct Arena<T> {
+pub(crate) struct Arena<T> {
     slots: Vec<Slot<T>>,
     free: Vec<u32>,
 }
@@ -57,7 +57,7 @@ pub struct Arena<T> {
 impl<T> Arena<T> {
     /// An empty arena.
     #[must_use]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             slots: Vec::new(),
             free: Vec::new(),
@@ -69,7 +69,7 @@ impl<T> Arena<T> {
     /// # Panics
     /// Panics if more than `u32::MAX` slots have ever been allocated (the index
     /// space is exhausted) — unreachable for the reactor's handful of descriptors.
-    pub fn insert(&mut self, value: T) -> Key {
+    pub(crate) fn insert(&mut self, value: T) -> Key {
         if let Some(index) = self.free.pop() {
             let slot = &mut self.slots[index as usize];
             slot.value = Some(value);
@@ -92,18 +92,18 @@ impl<T> Arena<T> {
 
     /// A shared reference to the value `key` addresses, or `None` if stale.
     #[must_use]
-    pub fn get(&self, key: Key) -> Option<&T> {
+    pub(crate) fn get(&self, key: Key) -> Option<&T> {
         self.slot(key)?.value.as_ref()
     }
 
     /// A mutable reference to the value `key` addresses, or `None` if stale.
-    pub fn get_mut(&mut self, key: Key) -> Option<&mut T> {
+    pub(crate) fn get_mut(&mut self, key: Key) -> Option<&mut T> {
         self.slot_mut(key)?.value.as_mut()
     }
 
     /// Remove and return the value `key` addresses, freeing the slot. A stale key
     /// removes nothing and returns `None`.
-    pub fn remove(&mut self, key: Key) -> Option<T> {
+    pub(crate) fn remove(&mut self, key: Key) -> Option<T> {
         let slot = self.slot_mut(key)?;
         let value = slot.value.take()?;
         // Bumping the generation strands every existing key to this slot; wrapping
@@ -115,7 +115,7 @@ impl<T> Arena<T> {
 
     /// Whether `key` still addresses a live value.
     #[must_use]
-    pub fn contains(&self, key: Key) -> bool {
+    pub(crate) fn contains(&self, key: Key) -> bool {
         self.get(key).is_some()
     }
 

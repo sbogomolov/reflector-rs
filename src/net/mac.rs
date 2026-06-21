@@ -10,18 +10,18 @@ use thiserror::Error;
 
 /// A 48-bit IEEE 802 MAC address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MacAddr([u8; 6]);
+pub(crate) struct MacAddr([u8; 6]);
 
 impl MacAddr {
     /// The six address bytes, in transmission order.
     #[must_use]
-    pub const fn octets(self) -> [u8; 6] {
+    pub(crate) const fn octets(self) -> [u8; 6] {
         self.0
     }
 
     /// The L2 broadcast address, `ff:ff:ff:ff:ff:ff`.
     #[must_use]
-    pub const fn broadcast() -> Self {
+    pub(crate) const fn broadcast() -> Self {
         MacAddr([0xff; 6])
     }
 
@@ -32,7 +32,7 @@ impl MacAddr {
     /// # Panics
     /// Panics in debug builds if `addr` is not a multicast address.
     #[must_use]
-    pub fn multicast_for(addr: IpAddr) -> Self {
+    pub(crate) fn multicast_for(addr: IpAddr) -> Self {
         debug_assert!(
             addr.is_multicast(),
             "multicast_for requires a multicast address"
@@ -60,7 +60,7 @@ impl fmt::Display for MacAddr {
 /// Error returned when a string is not a valid [`MacAddr`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 #[error("expected six colon-separated hex octets")]
-pub struct ParseMacAddrError;
+pub(crate) struct ParseMacAddrError;
 
 impl FromStr for MacAddr {
     type Err = ParseMacAddrError;

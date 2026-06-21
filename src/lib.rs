@@ -4,11 +4,15 @@
 //! The behavior lives in this library crate so it stays testable in-process;
 //! the binary (`src/main.rs`) is a thin shim over [`run`].
 
-pub mod config;
+mod config;
 mod error;
 mod logging;
-pub mod net;
-pub mod reactor;
+// net and reactor have no in-crate caller yet (`run` drives the reactor and the
+// reflectors use net in later steps); allow dead code until they are wired.
+#[allow(dead_code)]
+mod net;
+#[allow(dead_code)]
+mod reactor;
 
 pub use self::error::{Error, Result};
 pub use self::logging::init as init_logging;

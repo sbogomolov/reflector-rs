@@ -21,7 +21,7 @@
 mod arena;
 mod poll;
 
-pub use self::arena::Key;
+pub(crate) use self::arena::Key;
 
 use std::io;
 use std::num::NonZeroUsize;
@@ -42,7 +42,7 @@ const EVENT_CAPACITY: NonZeroUsize = NonZeroUsize::new(64).unwrap();
 /// while write interest is armed (see [`Reactor::set_write_interest`]). Each is
 /// handed the fd and `&mut Reactor`, so a handler can register or unregister
 /// others, arm/disarm its own write interest, etc.
-pub trait Handler {
+pub(crate) trait Handler {
     /// The registered fd is readable.
     fn on_readable(&mut self, fd: RawFd, reactor: &mut Reactor);
 
@@ -53,11 +53,11 @@ pub trait Handler {
 /// What a registration is ready for in a given dispatch — the event a poll loop
 /// (or a test) feeds the reactor.
 #[derive(Debug, Clone, Copy)]
-pub struct Readiness {
+pub(crate) struct Readiness {
     /// The fd is readable.
-    pub readable: bool,
+    pub(crate) readable: bool,
     /// The fd is writable.
-    pub writable: bool,
+    pub(crate) writable: bool,
 }
 
 /// One registered fd: the reactor owns the fd, tracks write interest, and holds
@@ -70,7 +70,7 @@ struct Registration {
 
 /// The single-threaded reactor: owns the registrations and the poller, and
 /// dispatches readiness to handlers.
-pub struct Reactor {
+pub(crate) struct Reactor {
     registrations: Arena<Registration>,
     poll: Poller,
 }
@@ -80,7 +80,7 @@ impl Reactor {
     ///
     /// # Errors
     /// Returns an error if the poller's backing fd (epoll/kqueue) cannot be created.
-    pub fn new() -> io::Result<Self> {
+    pub(crate) fn new() -> io::Result<Self> {
         Ok(Self {
             registrations: Arena::new(),
             poll: Poller::new(EVENT_CAPACITY)?,
@@ -94,7 +94,7 @@ impl Reactor {
     /// # Errors
     /// Returns an error if the kernel registration fails; the arena insert is
     /// rolled back so no partial registration remains.
-    pub fn register(&mut self, fd: OwnedFd, handler: Box<dyn Handler>) -> io::Result<Key> {
+    pub(crate) fn register(&mut self, fd: OwnedFd, handler: Box<dyn Handler>) -> io::Result<Key> {
         let raw = fd.as_raw_fd();
         let key = self.registrations.insert(Registration {
             fd,
@@ -115,7 +115,7 @@ impl Reactor {
     ///
     /// # Errors
     /// Returns an error if removing the kernel interest fails.
-    pub fn unregister(&mut self, key: Key) -> io::Result<bool> {
+    pub(crate) fn unregister(&mut self, key: Key) -> io::Result<bool> {
         let Some(reg) = self.registrations.remove(key) else {
             log::trace!("unregister: {key:?} already gone");
             return Ok(false);
@@ -132,7 +132,7 @@ impl Reactor {
     ///
     /// # Errors
     /// Returns an error if updating the kernel's write interest fails.
-    pub fn set_write_interest(&mut self, key: Key, enabled: bool) -> io::Result<bool> {
+    pub(crate) fn set_write_interest(&mut self, key: Key, enabled: bool) -> io::Result<bool> {
         let Some(reg) = self.registrations.get_mut(key) else {
             log::trace!("set_write_interest: {key:?} already gone");
             return Ok(false);
@@ -153,7 +153,7 @@ impl Reactor {
 
     /// Whether `key` still addresses a live registration.
     #[must_use]
-    pub fn is_registered(&self, key: Key) -> bool {
+    pub(crate) fn is_registered(&self, key: Key) -> bool {
         self.registrations.contains(key)
     }
 
@@ -163,7 +163,7 @@ impl Reactor {
     /// # Errors
     /// Returns an error if the underlying wait fails. An interrupted wait reports
     /// no events rather than erroring.
-    pub fn poll_once(&mut self, timeout: Option<Duration>) -> io::Result<()> {
+    pub(crate) fn poll_once(&mut self, timeout: Option<Duration>) -> io::Result<()> {
         let ready = self.poll.wait(timeout)?;
         for i in 0..ready {
             // Copy the event out (it is `Copy`) so the `self.poll` borrow ends
@@ -177,7 +177,7 @@ impl Reactor {
     /// Deliver `readiness` to the registration `key` addresses — the seam
     /// [`poll_once`](Self::poll_once) drives the reactor through. A stale key is a
     /// safe no-op.
-    pub fn dispatch(&mut self, key: Key, readiness: Readiness) {
+    fn dispatch(&mut self, key: Key, readiness: Readiness) {
         // Take the handler out so `self` is free to be borrowed for the call. The
         // slot stays put, so `key` stays valid and the handler can be returned.
         let Some(reg) = self.registrations.get_mut(key) else {

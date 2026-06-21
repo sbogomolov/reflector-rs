@@ -13,6 +13,7 @@ libc = "0.2"
 
 [lints.rust]
 warnings = "deny"
+unreachable_pub = "deny"
 
 [lints.clippy]
 all = "deny"
