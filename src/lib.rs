@@ -7,8 +7,9 @@
 mod config;
 mod error;
 mod logging;
-// net and reactor have no in-crate caller yet (`run` drives the reactor and the
-// reflectors use net in later steps); allow dead code until they are wired.
+// `net` has no caller until the reflectors are built, and a few reactor APIs
+// (set_write_interest, is_registered) have none until then. Allow dead code
+// until the data path lands.
 #[allow(dead_code)]
 mod net;
 #[allow(dead_code)]
@@ -18,6 +19,7 @@ pub use self::error::{Error, Result};
 pub use self::logging::init as init_logging;
 
 use self::config::Config;
+use self::reactor::Reactor;
 
 /// Run the reflector to completion.
 ///
@@ -26,7 +28,8 @@ use self::config::Config;
 /// variables are merged on top (and can configure reflectors on their own).
 ///
 /// # Errors
-/// Returns [`Error`] if configuration loading or validation fails.
+/// Returns [`Error`] if configuration loading or validation fails, or if the
+/// reactor cannot be created or its event loop fails.
 pub fn run(args: &[String]) -> Result<()> {
     let path = args.first().map(String::as_str);
     let toml_text = path.map(config::read_config_file).transpose()?;
@@ -47,5 +50,12 @@ pub fn run(args: &[String]) -> Result<()> {
         "loaded {count} reflector{}",
         if count == 1 { "" } else { "s" }
     );
+
+    // The capture layer and reflectors will register their fds here; for now the
+    // reactor carries only its shutdown self-pipe, so run() blocks until a signal.
+    let mut reactor = Reactor::new()?;
+    log::info!("running; press Ctrl-C or send SIGTERM to stop");
+    reactor.run()?;
+    log::info!("stopped");
     Ok(())
 }

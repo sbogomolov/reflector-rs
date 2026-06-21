@@ -6,6 +6,7 @@
 //! than reaching through it.
 
 use std::fmt;
+use std::io;
 
 use thiserror::Error;
 
@@ -30,6 +31,10 @@ enum ErrorKind {
     /// Configuration could not be loaded or failed validation.
     #[error("config: {0}")]
     Config(#[from] ConfigError),
+    /// A reactor or syscall failure. The reactor is currently the crate's only
+    /// source of a raw `io::Error`, so the blanket `From` below lands here.
+    #[error("reactor: {0}")]
+    Reactor(#[from] io::Error),
 }
 
 impl fmt::Display for Error {
@@ -47,5 +52,11 @@ impl std::error::Error for Error {
 impl From<ConfigError> for Error {
     fn from(source: ConfigError) -> Self {
         Self(ErrorKind::Config(source))
+    }
+}
+
+impl From<io::Error> for Error {
+    fn from(source: io::Error) -> Self {
+        Self(ErrorKind::Reactor(source))
     }
 }
