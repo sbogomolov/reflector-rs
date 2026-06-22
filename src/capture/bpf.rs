@@ -16,6 +16,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use libc::{c_uint, c_ulong, c_void};
 
+use super::LinkType;
 use super::filter::{BpfInsn, DLT_NULL_UDP_FILTER, ETHERNET_UDP_FILTER};
 
 // DLT_EN10MB (Ethernet, 1) and DLT_NULL (0) are stable BPF link types,
@@ -27,16 +28,6 @@ const DLT_NULL: c_uint = 0;
 const _: () = assert!(DLT_EN10MB == libc::DLT_EN10MB);
 #[cfg(target_os = "macos")]
 const _: () = assert!(DLT_NULL == libc::DLT_NULL);
-
-/// The link-layer framing BPF reports for the bound interface. It selects the
-/// capture filter and tells a consumer how to strip the link header before parsing
-/// L3: a 14-byte Ethernet header, or `DLT_NULL`'s 4-byte host-order address family
-/// (used on the BSD loopback and tunnel interfaces), then the IP packet.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum LinkType {
-    Ethernet,
-    DltNull,
-}
 
 /// `struct bpf_program` — the filter handed to `BIOCSETF`. libc provides this
 /// (and `bpf_insn`) on FreeBSD but not apple, so define it for both; the asserts
@@ -316,7 +307,7 @@ fn open_bpf_device() -> io::Result<OwnedFd> {
     for n in 0..256 {
         let path = format!("/dev/bpf{n}\0");
         // SAFETY: `path` is NUL-terminated.
-        let raw = unsafe { libc::open(path.as_ptr().cast(), libc::O_RDWR) };
+        let raw = unsafe { libc::open(path.as_ptr().cast(), libc::O_RDWR | libc::O_CLOEXEC) };
         if raw >= 0 {
             // SAFETY: `open` returned a fresh owned fd.
             return Ok(unsafe { OwnedFd::from_raw_fd(raw) });
@@ -358,6 +349,7 @@ mod tests {
     use std::mem::offset_of;
 
     use super::*;
+    use crate::capture::open_or_skip;
 
     /// Append one synthetic BPF record (header + frame + word-align padding) to
     /// `batch`. Serializes the header field-by-field at its repr(C) offsets rather
@@ -438,54 +430,6 @@ mod tests {
         assert!(parse_record(&batch).is_err());
     }
 
-    // Live capture against the real kernel — validates the ioctl sequence and
-    // that the libc::bpf_hdr layout matches what the kernel writes (the synthetic
-    // tests only check the walk against our own layout). Dynamically skips when
-    // BPF is unavailable (no access, or REFLECTOR_TEST_IFACE unset); fails on real
-    // errors.
-    #[test]
-    fn live_capture_decodes_real_frames() {
-        let Some(iface) = std::env::var_os("REFLECTOR_TEST_IFACE") else {
-            eprintln!("skip live_capture: set REFLECTOR_TEST_IFACE to an Ethernet interface");
-            return;
-        };
-        let iface = iface.to_string_lossy();
-        let mut capture = match Capture::open(&iface) {
-            Ok(capture) => capture,
-            Err(e)
-                if e.kind() == io::ErrorKind::PermissionDenied
-                    || e.raw_os_error() == Some(libc::EACCES) =>
-            {
-                eprintln!("skip live_capture: no BPF access ({e})");
-                return;
-            }
-            Err(e) => panic!("Capture::open({iface}) failed: {e}"),
-        };
-        assert_eq!(capture.link_type(), LinkType::Ethernet);
-
-        // Poll briefly for ambient UDP traffic and validate each frame's layout:
-        // every frame the kernel filter passed must be an IPv4/IPv6 Ethernet frame,
-        // so a wrong `libc::bpf_hdr` layout (mis-sliced offsets) would corrupt these.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        let mut validated = 0u32;
-        while validated < 8 && std::time::Instant::now() < deadline {
-            match capture.next_frame() {
-                Ok(Some(frame)) => {
-                    assert!(frame.len() >= 14, "frame shorter than an Ethernet header");
-                    let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
-                    assert!(
-                        ethertype == 0x0800 || ethertype == 0x86dd,
-                        "filter passed a non-IP ethertype {ethertype:#06x}",
-                    );
-                    validated += 1;
-                }
-                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
-                Err(e) => panic!("next_frame failed: {e}"),
-            }
-        }
-        eprintln!("live_capture: validated {validated} frame(s) on {iface}");
-    }
-
     /// Send a UDP probe to `bind` (a v4 or v6 loopback address) and confirm the BPF
     /// backend captures it as a `DLT_NULL` frame: a 4-byte host-order `family`, then
     /// an IP header whose version nibble is `version` (so the link header is exactly
@@ -525,19 +469,9 @@ mod tests {
     // Traffic to 127.0.0.1 / ::1 is deterministic — no env var needed. Dynamically
     // skips when BPF (or IPv6 loopback) is unavailable; fails on real errors.
     #[test]
-    fn loopback_capture_decodes_known_frames() {
-        let mut capture = match Capture::open("lo0") {
-            Ok(capture) => capture,
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    io::ErrorKind::PermissionDenied | io::ErrorKind::NotFound
-                ) || e.raw_os_error() == Some(libc::EACCES) =>
-            {
-                eprintln!("skip loopback_capture: no BPF access ({e})");
-                return;
-            }
-            Err(e) => panic!("Capture::open(lo0) failed: {e}"),
+    fn loopback_capture_decodes_known_frames() -> io::Result<()> {
+        let Some(mut capture) = open_or_skip("lo0", "loopback_capture")? else {
+            return Ok(());
         };
         assert_eq!(capture.link_type(), LinkType::DltNull);
 
@@ -561,6 +495,7 @@ mod tests {
         } else {
             eprintln!("skip loopback IPv6: ::1 unavailable");
         }
+        Ok(())
     }
 
     // Probe whether FreeBSD loops a BPF-injected frame back into the local stack.
@@ -572,23 +507,13 @@ mod tests {
     // means FreeBSD behaves like macOS — loopback send isn't observable this way.
     #[cfg(target_os = "freebsd")]
     #[test]
-    fn loopback_send_reaches_a_local_socket() {
+    fn loopback_send_reaches_a_local_socket() -> io::Result<()> {
         use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6, UdpSocket};
 
         const PROBE: &[u8] = b"reflector-loopback-send-probe";
 
-        let cap = match Capture::open("lo0") {
-            Ok(cap) => cap,
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    io::ErrorKind::PermissionDenied | io::ErrorKind::NotFound
-                ) || e.raw_os_error() == Some(libc::EACCES) =>
-            {
-                eprintln!("skip loopback_send: no BPF access ({e})");
-                return;
-            }
-            Err(e) => panic!("Capture::open(lo0) failed: {e}"),
+        let Some(cap) = open_or_skip("lo0", "loopback_send")? else {
+            return Ok(());
         };
 
         // IPv4 is always available on lo0.
@@ -613,6 +538,7 @@ mod tests {
         } else {
             eprintln!("skip loopback_send IPv6: ::1 unavailable");
         }
+        Ok(())
     }
 
     /// Inject `frame` on `cap`'s interface and assert the bound `receiver` gets

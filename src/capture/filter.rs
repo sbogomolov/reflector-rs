@@ -6,13 +6,18 @@
 
 /// One classic-BPF instruction (`{ u16 code; u8 jt; u8 jf; u32 k }`).
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct BpfInsn {
     pub(crate) code: u16,
     pub(crate) jt: u8,
     pub(crate) jf: u8,
     pub(crate) k: u32,
 }
+
+// On Linux the same array installs via `SO_ATTACH_FILTER` as a `sock_filter`
+// program; anchor the layout to libc where it provides the type.
+#[cfg(target_os = "linux")]
+const _: () = assert!(size_of::<BpfInsn>() == size_of::<libc::sock_filter>());
 
 const fn insn(code: u16, jt: u8, jf: u8, k: u32) -> BpfInsn {
     BpfInsn { code, jt, jf, k }
@@ -43,6 +48,31 @@ pub(crate) const ETHERNET_UDP_FILTER: [BpfInsn; 9] = [
     insn(0x0030, 0, 0, 0x0000_0017), // BPF_LD|BPF_B|BPF_ABS  [23] IPv4 protocol
     insn(0x0015, 0, 1, 0x0000_0011), // BPF_JMP|BPF_JEQ|BPF_K 17 UDP
     insn(0x0006, 0, 0, 0xffff_ffff), // BPF_RET|BPF_K accept
+    insn(0x0006, 0, 0, 0x0000_0000), // BPF_RET|BPF_K drop
+];
+
+/// Prepended to [`ETHERNET_UDP_FILTER`] on Linux kernels without
+/// `PACKET_IGNORE_OUTGOING`: the `SKF_AD_PKTTYPE` ancillary load reads
+/// `skb->pkt_type`, and frames we sent (`PACKET_OUTGOING`) are dropped — so the
+/// capture socket never re-receives its own injections.
+///
+/// ```text
+/// ldb #pkttype                  skb->pkt_type via the ancillary offset
+/// jeq PACKET_OUTGOING -> drop@2    else fall through to the classifier
+/// ret 0                         drop
+/// ```
+#[cfg(target_os = "linux")]
+pub(crate) const DROP_OUTGOING_PROLOGUE: [BpfInsn; 3] = [
+    // BPF_LD|BPF_B|BPF_ABS: A = pkt_type, from the negative ancillary offset.
+    insn(
+        0x0030,
+        0,
+        0,
+        (libc::SKF_AD_OFF + libc::SKF_AD_PKTTYPE).cast_unsigned(),
+    ),
+    // Our TX (PACKET_OUTGOING): jt=0 -> drop; else jf=1 -> the classifier below.
+    // (`u32::from` isn't const-stable, so widen the u8 constant with `as`.)
+    insn(0x0015, 0, 1, libc::PACKET_OUTGOING as u32),
     insn(0x0006, 0, 0, 0x0000_0000), // BPF_RET|BPF_K drop
 ];
 
