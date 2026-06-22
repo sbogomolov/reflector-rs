@@ -130,8 +130,7 @@ fn self_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
     }
 
     // SAFETY: `pipe`/`pipe2` succeeded, so both fds are fresh and owned.
-    let read = unsafe { OwnedFd::from_raw_fd(fds[0]) };
-    let write = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+    let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
 
     #[cfg(target_os = "macos")]
     {
@@ -145,14 +144,22 @@ fn self_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
 /// Set `FD_CLOEXEC` and `O_NONBLOCK` on `fd` (the macOS path, lacking `pipe2`).
 #[cfg(target_os = "macos")]
 fn set_cloexec_nonblock(fd: RawFd) -> io::Result<()> {
-    // SAFETY: `fd` is a valid open fd; F_GETFD/F_SETFD take and return descriptor flags.
+    // SAFETY: `fd` is a valid open fd; F_GETFD returns the descriptor flags.
     let fd_flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-    if fd_flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, fd_flags | libc::FD_CLOEXEC) } < 0 {
+    if fd_flags < 0 {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: same fd; F_GETFL/F_SETFL take and return status flags.
+    // SAFETY: `fd` is valid; F_SETFD writes the descriptor flags.
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, fd_flags | libc::FD_CLOEXEC) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` is valid; F_GETFL returns the status flags.
     let status = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if status < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, status | libc::O_NONBLOCK) } < 0 {
+    if status < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` is valid; F_SETFL writes the status flags.
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, status | libc::O_NONBLOCK) } < 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
@@ -201,6 +208,7 @@ mod tests {
 
         // Non-blocking: reading the empty pipe returns EAGAIN rather than blocking.
         let mut buf = [0u8; 1];
+        // SAFETY: read up to 1 byte into `buf` from the valid read-end fd.
         let n = unsafe { libc::read(read.as_raw_fd(), buf.as_mut_ptr().cast(), 1) };
         assert_eq!(n, -1);
         assert_eq!(
@@ -210,6 +218,7 @@ mod tests {
 
         // Close-on-exec is set on both ends.
         for fd in [read.as_raw_fd(), write.as_raw_fd()] {
+            // SAFETY: F_GETFD reads the descriptor flags of a valid fd.
             let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
             assert!(flags >= 0 && flags & libc::FD_CLOEXEC != 0);
         }
@@ -222,9 +231,12 @@ mod tests {
         let (guard, read) = ShutdownPipe::install().unwrap();
 
         // Our handler must catch SIGINT (write a byte), not terminate the process.
-        assert_eq!(unsafe { libc::raise(libc::SIGINT) }, 0);
+        // SAFETY: `raise` just delivers a signal to the current process.
+        let raised = unsafe { libc::raise(libc::SIGINT) };
+        assert_eq!(raised, 0);
 
         let mut buf = [0u8; 4];
+        // SAFETY: read up to `buf.len()` bytes into `buf` from the valid read-end fd.
         let n = unsafe { libc::read(read.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
         assert!(n >= 1);
 
