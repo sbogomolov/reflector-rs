@@ -446,9 +446,11 @@ mod tests {
         let target = receiver.local_addr().unwrap();
         let sender = std::net::UdpSocket::bind(bind).unwrap();
 
+        // The capture is armed before the send and BIOCIMMEDIATE delivers the looped
+        // frame at once, where it waits until read — so one send then polling captures it.
+        sender.send_to(PROBE, target).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while std::time::Instant::now() < deadline {
-            sender.send_to(PROBE, target).unwrap();
             while let Some(frame) = capture.next_frame().unwrap() {
                 if frame.len() > 4
                     && u32::from_ne_bytes(frame[..4].try_into().unwrap()) == family

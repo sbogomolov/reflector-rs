@@ -327,11 +327,13 @@ mod tests {
         let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
 
         // An lo frame is [14-byte Ethernet][IPv4][UDP][payload]; finding our payload
-        // at the tail behind an IPv4/IPv6 ethertype proves the layout decoded.
+        // at the tail behind an IPv4/IPv6 ethertype proves the layout decoded. The
+        // capture is armed before the send, and the looped frame waits in the socket
+        // buffer until drained, so one send then polling captures it.
+        sender.send_to(PROBE, target).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         let mut decoded = false;
         while !decoded && std::time::Instant::now() < deadline {
-            sender.send_to(PROBE, target).unwrap();
             while let Some(frame) = capture.next_frame()? {
                 if frame.len() >= 14 && frame.ends_with(PROBE) {
                     let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
@@ -368,10 +370,12 @@ mod tests {
         let n = frame::ethernet_ipv4_udp(mac, mac, src, dst, 64, PROBE, &mut buf)
             .expect("build Ethernet frame");
 
+        // The injected frame loops to the input tap and waits there until drained, so
+        // one send then polling captures it.
+        capture.send(&buf[..n]).expect("send on lo");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         let mut looped = false;
         while !looped && std::time::Instant::now() < deadline {
-            capture.send(&buf[..n]).expect("send on lo");
             while let Some(frame) = capture.next_frame()? {
                 if frame.ends_with(PROBE) {
                     looped = true;
