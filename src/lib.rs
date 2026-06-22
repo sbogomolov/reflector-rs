@@ -7,9 +7,11 @@
 mod config;
 mod error;
 mod logging;
-// `net` has no caller until the reflectors are built, and a few reactor APIs
-// (set_write_interest, is_registered) have none until then. Allow dead code
-// until the data path lands.
+// `net`/`capture` have no caller until the reflectors are built, and a few
+// reactor APIs (set_write_interest, is_registered) have none until then. Allow
+// dead code until the data path lands.
+#[allow(dead_code)]
+mod capture;
 #[allow(dead_code)]
 mod net;
 #[allow(dead_code)]
