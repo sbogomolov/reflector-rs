@@ -1,8 +1,8 @@
-//! BPF packet capture (macOS; FreeBSD to follow).
+//! BPF packet capture (macOS and FreeBSD).
 //!
 //! Opens `/dev/bpfN`, binds it to an interface, installs a UDP-only classic-BPF
 //! filter, and reads link-layer frames. One `read` returns a *batch* of frames,
-//! each prefixed by a variable-length [`BpfHdr`] and padded so the next record
+//! each prefixed by a variable-length `bpf_hdr` and padded so the next record
 //! starts on a `BPF_ALIGNMENT` boundary; [`Capture::next_frame`] walks that batch.
 //!
 //! Init order matters: bind (`BIOCSETIF`) happens *before* the filter
@@ -18,58 +18,35 @@ use libc::{c_uint, c_ulong, c_void};
 
 use super::filter::{BpfInsn, ETHERNET_UDP_FILTER};
 
-// --- ioctl request encoding (4.4BSD <sys/ioccom.h>; macOS and FreeBSD) -------
-const IOC_OUT: c_ulong = 0x4000_0000; // copies out (kernel -> user)
-const IOC_IN: c_ulong = 0x8000_0000; // copies in (user -> kernel)
-const IOCPARM_MASK: c_ulong = 0x1fff;
+// DLT_EN10MB (Ethernet) is a stable BPF link type (1), but libc exposes it only
+// on apple — define it locally, anchored to libc's value where available.
+const DLT_EN10MB: c_uint = 1;
+#[cfg(target_os = "macos")]
+const _: () = assert!(DLT_EN10MB == libc::DLT_EN10MB);
 
-const fn ioc(inout: c_ulong, group: u8, num: u8, len: usize) -> c_ulong {
-    inout | (((len as c_ulong) & IOCPARM_MASK) << 16) | ((group as c_ulong) << 8) | num as c_ulong
-}
-const fn iow(group: u8, num: u8, len: usize) -> c_ulong {
-    ioc(IOC_IN, group, num, len)
-}
-const fn ior(group: u8, num: u8, len: usize) -> c_ulong {
-    ioc(IOC_OUT, group, num, len)
-}
-
-// Anchor the encoding to values libc provides as ground truth: if a direction
-// bit or the field arithmetic were wrong, these fail to compile. BIOCSSEESENT
-// pins the IOC_IN (`iow`) path, BIOCGSEESENT the IOC_OUT (`ior`) path.
-const _: () = assert!(iow(b'B', 119, size_of::<c_uint>()) == libc::BIOCSSEESENT);
-const _: () = assert!(ior(b'B', 118, size_of::<c_uint>()) == libc::BIOCGSEESENT);
-
-const BIOCGBLEN: c_ulong = ior(b'B', 102, size_of::<c_uint>());
-const BIOCSETF: c_ulong = iow(b'B', 103, size_of::<BpfProgram>());
-const BIOCGDLT: c_ulong = ior(b'B', 106, size_of::<c_uint>());
-const BIOCSETIF: c_ulong = iow(b'B', 108, size_of::<libc::ifreq>());
-const BIOCIMMEDIATE: c_ulong = iow(b'B', 112, size_of::<c_uint>());
-// BIOCSSEESENT is provided by libc.
-
-/// `struct bpf_program` — the filter handed to `BIOCSETF`.
+/// `struct bpf_program` — the filter handed to `BIOCSETF`. libc provides this
+/// (and `bpf_insn`) on FreeBSD but not apple, so define it for both; the asserts
+/// anchor the layout to libc where it exists. The per-frame header is read as
+/// `libc::bpf_hdr` (apple + FreeBSD both have it, with the right per-OS timestamp).
 #[repr(C)]
 struct BpfProgram {
     bf_len: c_uint,
     bf_insns: *mut BpfInsn,
 }
+#[cfg(target_os = "freebsd")]
+const _: () = assert!(size_of::<BpfProgram>() == size_of::<libc::bpf_program>());
+#[cfg(target_os = "freebsd")]
+const _: () = assert!(size_of::<BpfInsn>() == size_of::<libc::bpf_insn>());
 
-/// The per-record header BPF prefixes each frame with. On 64-bit macOS the
-/// timestamp here is 32-bit (a `timeval32`), not the native `timeval`; the field
-/// widths set the offsets of the fields we actually read. The `bh_` prefix
-/// mirrors the C struct, so allow the field-naming lint.
-#[repr(C)]
-#[allow(clippy::struct_field_names)]
-struct BpfHdr {
-    bh_tstamp_sec: i32,
-    bh_tstamp_usec: i32,
-    bh_caplen: u32,  // bytes captured into the buffer
-    bh_datalen: u32, // the frame's original length (caplen < datalen => truncated)
-    bh_hdrlen: u16,  // offset from the record start to the packet bytes
-}
+// `BPF_ALIGNMENT` as a usize. libc types it differently per platform (`c_int` on
+// apple, `usize` on FreeBSD), so normalize it once here.
+#[cfg(target_os = "macos")]
+const BPF_ALIGN: usize = libc::BPF_ALIGNMENT as usize;
+#[cfg(target_os = "freebsd")]
+const BPF_ALIGN: usize = libc::BPF_ALIGNMENT;
 
 const fn bpf_wordalign(x: usize) -> usize {
-    let align = libc::BPF_ALIGNMENT as usize;
-    (x + (align - 1)) & !(align - 1)
+    (x + (BPF_ALIGN - 1)) & !(BPF_ALIGN - 1)
 }
 
 /// A raw-capture handle on one interface: an owned BPF fd plus a reused read
@@ -113,12 +90,12 @@ impl Capture {
                 name.len(),
             );
         }
-        ioctl(&fd, BIOCSETIF, (&raw mut ifr).cast())?;
+        ioctl(&fd, libc::BIOCSETIF, (&raw mut ifr).cast())?;
 
         // Require Ethernet; DLT_NULL loopback (a different header + filter) is deferred.
         let mut dlt: c_uint = 0;
-        ioctl(&fd, BIOCGDLT, (&raw mut dlt).cast())?;
-        if dlt != libc::DLT_EN10MB {
+        ioctl(&fd, libc::BIOCGDLT, (&raw mut dlt).cast())?;
+        if dlt != DLT_EN10MB {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 format!(
@@ -129,7 +106,7 @@ impl Capture {
 
         // Deliver each frame as it arrives instead of blocking until the buffer fills.
         let mut immediate: c_uint = 1;
-        ioctl(&fd, BIOCIMMEDIATE, (&raw mut immediate).cast())?;
+        ioctl(&fd, libc::BIOCIMMEDIATE, (&raw mut immediate).cast())?;
 
         // Don't hand us our own injected frames (loop prevention between mirrored
         // reflector pairs).
@@ -142,11 +119,11 @@ impl Capture {
             bf_len: c_uint::try_from(filter.len()).expect("filter length fits c_uint"),
             bf_insns: filter.as_ptr().cast_mut(),
         };
-        ioctl(&fd, BIOCSETF, (&raw mut program).cast())?;
+        ioctl(&fd, libc::BIOCSETF, (&raw mut program).cast())?;
 
         // Size the read buffer to the kernel's preferred BPF buffer length.
         let mut blen: c_uint = 0;
-        ioctl(&fd, BIOCGBLEN, (&raw mut blen).cast())?;
+        ioctl(&fd, libc::BIOCGBLEN, (&raw mut blen).cast())?;
 
         set_nonblocking(&fd)?;
 
@@ -266,16 +243,16 @@ enum Record {
 
 /// Parse the BPF record at the front of `record` — the still-unread slice of the
 /// current batch — returning it plus how many bytes to advance past it (its
-/// `BpfHdr` + frame, padded to `BPF_ALIGNMENT`). The frame range is relative to
-/// `record`. Pure (no I/O) so the batch walk — the fiddliest part — is
-/// unit-testable against synthetic buffers.
+/// `libc::bpf_hdr` + frame, padded to `BPF_ALIGNMENT`). The frame range is
+/// relative to `record`. Pure (no I/O) so the batch walk — the fiddliest part —
+/// is unit-testable against synthetic buffers.
 fn parse_record(record: &[u8]) -> io::Result<(Record, usize)> {
-    if size_of::<BpfHdr>() > record.len() {
+    if size_of::<libc::bpf_hdr>() > record.len() {
         return Err(io::Error::other("BPF batch ended mid-header"));
     }
-    // SAFETY: the bound above keeps the header within `record`; `BpfHdr` is plain
-    // repr(C) data and `read_unaligned` tolerates any record alignment.
-    let header = unsafe { record.as_ptr().cast::<BpfHdr>().read_unaligned() };
+    // SAFETY: the bound above keeps the header within `record`; `libc::bpf_hdr`
+    // is plain repr(C) data and `read_unaligned` tolerates any record alignment.
+    let header = unsafe { record.as_ptr().cast::<libc::bpf_hdr>().read_unaligned() };
 
     let frame_start = header.bh_hdrlen as usize;
     let frame_end = frame_start + header.bh_caplen as usize;
@@ -352,16 +329,17 @@ mod tests {
 
     /// Append one synthetic BPF record (header + frame + word-align padding) to
     /// `batch`. Serializes the header field-by-field at its repr(C) offsets rather
-    /// than transmuting a `BpfHdr` (whose tail padding would be uninitialized).
+    /// than transmuting a `libc::bpf_hdr` (whose tail padding would be uninitialized).
     fn push_record(batch: &mut Vec<u8>, caplen: u32, datalen: u32, fill: u8) {
-        let hdrlen = u16::try_from(size_of::<BpfHdr>()).expect("header fits u16");
-        let mut header = [0u8; size_of::<BpfHdr>()];
-        header[offset_of!(BpfHdr, bh_caplen)..][..4].copy_from_slice(&caplen.to_ne_bytes());
-        header[offset_of!(BpfHdr, bh_datalen)..][..4].copy_from_slice(&datalen.to_ne_bytes());
-        header[offset_of!(BpfHdr, bh_hdrlen)..][..2].copy_from_slice(&hdrlen.to_ne_bytes());
+        let hdrlen = u16::try_from(size_of::<libc::bpf_hdr>()).expect("header fits u16");
+        let mut header = [0u8; size_of::<libc::bpf_hdr>()];
+        header[offset_of!(libc::bpf_hdr, bh_caplen)..][..4].copy_from_slice(&caplen.to_ne_bytes());
+        header[offset_of!(libc::bpf_hdr, bh_datalen)..][..4]
+            .copy_from_slice(&datalen.to_ne_bytes());
+        header[offset_of!(libc::bpf_hdr, bh_hdrlen)..][..2].copy_from_slice(&hdrlen.to_ne_bytes());
         batch.extend_from_slice(&header);
         batch.extend(std::iter::repeat_n(fill, caplen as usize));
-        while !batch.len().is_multiple_of(libc::BPF_ALIGNMENT as usize) {
+        while !batch.len().is_multiple_of(BPF_ALIGN) {
             batch.push(0);
         }
     }
@@ -415,7 +393,7 @@ mod tests {
 
     #[test]
     fn rejects_a_header_past_the_batch_end() {
-        let batch = vec![0u8; size_of::<BpfHdr>() - 1];
+        let batch = vec![0u8; size_of::<libc::bpf_hdr>() - 1];
         assert!(parse_record(&batch).is_err());
     }
 
@@ -423,15 +401,16 @@ mod tests {
     fn rejects_a_non_advancing_record() {
         // bh_hdrlen == 0 && bh_caplen == 0 would leave the cursor in place and spin
         // the drain loop; parse_record must reject it instead.
-        let mut batch = [0u8; size_of::<BpfHdr>()];
-        batch[offset_of!(BpfHdr, bh_datalen)..][..4].copy_from_slice(&1u32.to_ne_bytes());
+        let mut batch = [0u8; size_of::<libc::bpf_hdr>()];
+        batch[offset_of!(libc::bpf_hdr, bh_datalen)..][..4].copy_from_slice(&1u32.to_ne_bytes());
         assert!(parse_record(&batch).is_err());
     }
 
-    // Live capture against the real kernel — validates the ioctl sequence and that
-    // the BpfHdr layout matches what the kernel writes (the synthetic tests only
-    // check the walk against our own layout). Dynamically skips when BPF is
-    // unavailable (no access, or REFLECTOR_TEST_IFACE unset); fails on real errors.
+    // Live capture against the real kernel — validates the ioctl sequence and
+    // that the libc::bpf_hdr layout matches what the kernel writes (the synthetic
+    // tests only check the walk against our own layout). Dynamically skips when
+    // BPF is unavailable (no access, or REFLECTOR_TEST_IFACE unset); fails on real
+    // errors.
     #[test]
     fn live_capture_decodes_real_frames() {
         let Some(iface) = std::env::var_os("REFLECTOR_TEST_IFACE") else {
@@ -453,7 +432,7 @@ mod tests {
 
         // Poll briefly for ambient UDP traffic and validate each frame's layout:
         // every frame the kernel filter passed must be an IPv4/IPv6 Ethernet frame,
-        // so a wrong `BpfHdr` layout (mis-sliced offsets) would corrupt these.
+        // so a wrong `libc::bpf_hdr` layout (mis-sliced offsets) would corrupt these.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         let mut validated = 0u32;
         while validated < 8 && std::time::Instant::now() < deadline {
