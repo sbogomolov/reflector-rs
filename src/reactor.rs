@@ -14,9 +14,9 @@
 //!
 //! Dispatch **takes the handler out of its slot** for the duration of its call,
 //! so `&mut Reactor` is free to hand to the handler. The handler can therefore
-//! mutate the reactor freely — including registering new fds, which in the C++
-//! original risked invalidating the iterator mid-loop and needed a re-resolve;
-//! here nothing borrows the arena during the call, so it just works.
+//! mutate the reactor freely — including registering new fds, which a loop
+//! holding an iterator into the registration storage would risk invalidating
+//! mid-iteration; here nothing borrows the arena during the call, so it just works.
 
 mod arena;
 mod poll;
@@ -379,8 +379,9 @@ mod tests {
 
     #[test]
     fn handler_can_register_during_dispatch() {
-        // The C++ rehash hazard: registering a new fd mid-dispatch. Here nothing
-        // borrows the arena during the call, so it is simply allowed.
+        // The classic mid-dispatch hazard: registering a new fd while the loop is
+        // iterating the registrations. Here nothing borrows the arena during the
+        // call, so it is simply allowed.
         let mut reactor = Reactor::new().unwrap();
         let (a, _pa) = pair();
         let (c, _pc) = pair();
