@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicI32, Ordering};
 
 use libc::c_int;
 
-use super::{Handler, Reactor};
+use super::{Handler, Reactor, ReadyEvent};
 
 /// Signals that request a graceful shutdown.
 const SHUTDOWN_SIGNALS: [c_int; 2] = [libc::SIGINT, libc::SIGTERM];
@@ -101,14 +101,15 @@ pub(crate) struct SignalPipe {
     read: OwnedFd,
 }
 
-impl AsRawFd for SignalPipe {
-    fn as_raw_fd(&self) -> RawFd {
+impl SignalPipe {
+    /// The read-end fd to watch — handed to [`Reactor::register_with_fds`] at install.
+    pub(crate) fn read_fd(&self) -> RawFd {
         self.read.as_raw_fd()
     }
 }
 
 impl Handler for SignalPipe {
-    fn on_readable(&mut self, reactor: &mut Reactor) {
+    fn on_readable(&mut self, _event: ReadyEvent, reactor: &mut Reactor) {
         // Drain so a level-triggered wait does not keep re-reporting it.
         let mut buf = [0u8; 16];
         let fd = self.read.as_raw_fd();
@@ -248,7 +249,7 @@ mod tests {
 
         let mut buf = [0u8; 4];
         // SAFETY: read up to `buf.len()` bytes into `buf` from the valid read-end fd.
-        let n = unsafe { libc::read(pipe.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+        let n = unsafe { libc::read(pipe.read_fd(), buf.as_mut_ptr().cast(), buf.len()) };
         assert!(n >= 1);
 
         drop(guard); // restores the previous SIGINT/SIGTERM dispositions

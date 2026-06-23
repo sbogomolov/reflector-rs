@@ -19,12 +19,12 @@
 
 use std::io;
 use std::net::IpAddr;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, RawFd};
 
 use crate::capture::Capture;
 use crate::net::mac::MacAddr;
 use crate::net::packet::Packet;
-use crate::reactor::{Arena, Key, Reactor};
+use crate::reactor::{Arena, Handler, Key, Reactor, ReadyEvent};
 
 /// The most frames drained per readable event before yielding, so a flooded interface
 /// can't starve the others. `AF_PACKET` stops here and the level-triggered wait
@@ -39,6 +39,21 @@ const MAX_FRAMES_PER_EVENT: u32 = 64;
 /// touching an fd directly.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct CaptureKey(Key);
+
+impl CaptureKey {
+    /// Pack into a `u64` for the reactor's opaque `user_data` slot, recoverable via
+    /// [`from_u64`](Self::from_u64) (delegates to the arena [`Key`]).
+    #[must_use]
+    fn to_u64(self) -> u64 {
+        self.0.to_u64()
+    }
+
+    /// Reconstruct a key packed by [`to_u64`](Self::to_u64).
+    #[must_use]
+    fn from_u64(packed: u64) -> Self {
+        CaptureKey(Key::from_u64(packed))
+    }
+}
 
 /// An optional-field packet filter (the C++ `PacketFilter` parity): an unset field
 /// matches anything. A `src_mac`/`dst_mac` filter never matches a `DLT_NULL` packet,
@@ -109,6 +124,19 @@ impl PacketDispatcher {
         CaptureKey(self.captures.insert(Some(capture)))
     }
 
+    /// Each capture's `(fd, user_data)` for [`Reactor::register_with_fds`]: the reactor
+    /// watches them all under the dispatcher's one handler key, tagging each with its
+    /// [`CaptureKey`] so `on_readable` recovers the capture without a lookup.
+    pub(crate) fn capture_watches(&self) -> Vec<(RawFd, u64)> {
+        self.captures
+            .iter()
+            .filter_map(|(key, slot)| {
+                slot.as_ref()
+                    .map(|capture| (capture.as_raw_fd(), CaptureKey(key).to_u64()))
+            })
+            .collect()
+    }
+
     /// Register `handler`, gated by `filter`, for packets captured on `ingress`.
     pub(crate) fn register(
         &mut self,
@@ -140,7 +168,7 @@ impl PacketDispatcher {
     /// Drain the capture `ingress` addresses and route each parsed packet. Reads up to
     /// [`MAX_FRAMES_PER_EVENT`] frames, then yields for fairness (the BPF batch
     /// exception is via `has_buffered`); a read error abandons the batch and logs.
-    pub(crate) fn drain_and_route(&mut self, ingress: CaptureKey, reactor: &mut Reactor) {
+    fn drain_and_route(&mut self, ingress: CaptureKey, reactor: &mut Reactor) {
         // Take the ingress capture OUT: the parsed Packet then borrows a local, not
         // `self`, so `&mut self` is free for routing — and the reflector can send on the
         // OTHER captures still in the arena.
@@ -224,6 +252,15 @@ impl PacketDispatcher {
                 self.registrations[k].handler = Some(handler);
             }
         }
+    }
+}
+
+impl Handler for PacketDispatcher {
+    /// `event.user_data` is the ready capture's [`CaptureKey`] (tagged at registration),
+    /// so drain that capture directly — no fd lookup. A bad value resolves to a stale key
+    /// and is a logged drop in [`drain_and_route`](Self::drain_and_route).
+    fn on_readable(&mut self, event: ReadyEvent, reactor: &mut Reactor) {
+        self.drain_and_route(CaptureKey::from_u64(event.user_data), reactor);
     }
 }
 
@@ -495,6 +532,61 @@ mod tests {
             2,
             "both probes should route via the outer drain; the re-entrant call must no-op"
         );
+        Ok(())
+    }
+
+    // End-to-end through the reactor: register the dispatcher itself as a handler watching
+    // its capture fds, then let `poll_once` drive it. A looped UDP probe makes the ingress
+    // capture readable; the reactor names that exact fd, the dispatcher maps it back to the
+    // capture, drains it, and routes to the Echo, which re-emits on the egress key.
+    // Exercises the per-fd `on_readable`. Skips without capture access (no CAP_NET_RAW).
+    #[test]
+    fn reactor_drives_the_dispatcher_to_route_a_packet() -> io::Result<()> {
+        let Some(ingress_cap) = open_or_skip(LOOPBACK, "dispatch_reactor_in")? else {
+            return Ok(());
+        };
+        let Some(egress_cap) = open_or_skip(LOOPBACK, "dispatch_reactor_eg")? else {
+            return Ok(());
+        };
+
+        let receiver = UdpSocket::bind("127.0.0.1:0")?;
+        let target = receiver.local_addr()?;
+        let sender = UdpSocket::bind("127.0.0.1:0")?;
+
+        let mut dispatcher = PacketDispatcher::new();
+        let ingress = dispatcher.add_capture(ingress_cap);
+        let egress = dispatcher.add_capture(egress_cap);
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        dispatcher.register(
+            ingress,
+            Filter {
+                dst_port: Some(target.port()),
+                ..Filter::default()
+            },
+            Box::new(Echo {
+                egress,
+                scratch: vec![0u8; 2048].into_boxed_slice(),
+                seen: seen.clone(),
+            }),
+        );
+
+        let mut reactor = Reactor::new()?;
+        let watches = dispatcher.capture_watches();
+        reactor.register_with_fds(Box::new(dispatcher), &watches)?;
+
+        sender.send_to(PROBE, target)?;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while seen.borrow().is_empty() && Instant::now() < deadline {
+            reactor.poll_once(Some(Duration::from_millis(100)))?;
+        }
+
+        let records = seen.borrow();
+        assert!(
+            !records.is_empty(),
+            "the reflector never fired via the reactor"
+        );
+        assert_eq!(records[0].0, PROBE, "reflector saw the wrong payload");
+        assert!(records[0].1, "the keyed egress send failed");
         Ok(())
     }
 }

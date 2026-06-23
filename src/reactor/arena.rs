@@ -119,6 +119,21 @@ impl<T> Arena<T> {
         self.get(key).is_some()
     }
 
+    /// Iterate every live `(key, &value)`, in slot order; freed slots are skipped.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (Key, &T)> + '_ {
+        self.slots.iter().enumerate().filter_map(|(index, slot)| {
+            let value = slot.value.as_ref()?;
+            let index = u32::try_from(index).expect("arena index space exhausted");
+            Some((
+                Key {
+                    index,
+                    generation: slot.generation,
+                },
+                value,
+            ))
+        })
+    }
+
     /// The slot `key` names, only if its generation still matches.
     fn slot(&self, key: Key) -> Option<&Slot<T>> {
         self.slots
@@ -230,6 +245,20 @@ mod tests {
         // Both name the same slot: a mutation through one is seen through the other.
         *arena.get_mut(copy).unwrap() = "updated";
         assert_eq!(arena.get(key), Some(&"updated"));
+    }
+
+    #[test]
+    fn iter_yields_live_entries_with_their_keys() {
+        let mut arena = Arena::new();
+        let a = arena.insert("a");
+        let b = arena.insert("b");
+        arena.remove(a);
+        let c = arena.insert("c"); // reuses a's slot with a fresh generation
+
+        let mut items: Vec<(Key, &str)> = arena.iter().map(|(k, &v)| (k, v)).collect();
+        items.sort_by_key(|&(_, v)| v);
+        // `a` is gone; `b` and the reused-slot `c` remain, each with its current key.
+        assert_eq!(items, vec![(b, "b"), (c, "c")]);
     }
 
     #[test]
