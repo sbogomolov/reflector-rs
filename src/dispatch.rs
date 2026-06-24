@@ -536,6 +536,29 @@ mod tests {
         }
     }
 
+    /// A loopback probe rig: a bound `receiver` (its port reserved so the probe has a real
+    /// destination — the probe is captured off `lo`, never recv'd), the `target` to send to,
+    /// and a `sender`. The caller holds the receiver alive for the test's duration.
+    fn probe_rig() -> io::Result<(UdpSocket, SocketAddr, UdpSocket)> {
+        let receiver = UdpSocket::bind("127.0.0.1:0")?;
+        let target = receiver.local_addr()?;
+        let sender = UdpSocket::bind("127.0.0.1:0")?;
+        Ok((receiver, target, sender))
+    }
+
+    /// Call `step`, then sleep 20 ms, until `done` is true or `secs` elapse — the drive loop
+    /// for a non-blocking driver like `drain_and_route`. (The reactor test's `poll_once` loop
+    /// blocks on its own timeout instead, so it isn't routed through here.)
+    fn pump_until(secs: u64, mut done: impl FnMut() -> bool, mut step: impl FnMut()) {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        while !done() && Instant::now() < deadline {
+            step();
+            if !done() {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+
     #[test]
     fn wildcard_filter_matches_anything() {
         assert!(Filter::default().matches(&packet("10.0.0.1:1", "10.0.0.2:2", None, None)));
@@ -663,9 +686,7 @@ mod tests {
             return Ok(());
         };
 
-        let receiver = UdpSocket::bind("127.0.0.1:0")?;
-        let target = receiver.local_addr()?;
-        let sender = UdpSocket::bind("127.0.0.1:0")?;
+        let (_receiver, target, sender) = probe_rig()?;
 
         let mut dispatcher = PacketDispatcher::new();
         let ingress = dispatcher.add_capture(ingress_cap)?;
@@ -691,13 +712,11 @@ mod tests {
 
         let mut reactor = Reactor::new()?;
         sender.send_to(PROBE, target)?;
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while seen.borrow().is_empty() && Instant::now() < deadline {
-            dispatcher.drain_and_route(ingress, &mut reactor);
-            if seen.borrow().is_empty() {
-                std::thread::sleep(Duration::from_millis(20));
-            }
-        }
+        pump_until(
+            2,
+            || !seen.borrow().is_empty(),
+            || dispatcher.drain_and_route(ingress, &mut reactor),
+        );
 
         let records = seen.borrow();
         assert!(!records.is_empty(), "the reflector never fired");
@@ -739,9 +758,7 @@ mod tests {
             return Ok(());
         };
 
-        let receiver = UdpSocket::bind("127.0.0.1:0")?;
-        let target = receiver.local_addr()?;
-        let sender = UdpSocket::bind("127.0.0.1:0")?;
+        let (_receiver, target, sender) = probe_rig()?;
 
         let mut dispatcher = PacketDispatcher::new();
         let ingress = dispatcher.add_capture(ingress_cap)?;
@@ -765,13 +782,11 @@ mod tests {
         // drain inside the first packet has the second frame available to mis-route.
         std::thread::sleep(Duration::from_millis(50));
 
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while *calls.borrow() < 2 && Instant::now() < deadline {
-            dispatcher.drain_and_route(ingress, &mut reactor);
-            if *calls.borrow() < 2 {
-                std::thread::sleep(Duration::from_millis(20));
-            }
-        }
+        pump_until(
+            2,
+            || *calls.borrow() >= 2,
+            || dispatcher.drain_and_route(ingress, &mut reactor),
+        );
 
         assert_eq!(
             *calls.borrow(),
@@ -795,9 +810,7 @@ mod tests {
             return Ok(());
         };
 
-        let receiver = UdpSocket::bind("127.0.0.1:0")?;
-        let target = receiver.local_addr()?;
-        let sender = UdpSocket::bind("127.0.0.1:0")?;
+        let (_receiver, target, sender) = probe_rig()?;
 
         let mut dispatcher = PacketDispatcher::new();
         let ingress = dispatcher.add_capture(ingress_cap)?;
@@ -887,9 +900,7 @@ mod tests {
             return Ok(());
         };
 
-        let receiver = UdpSocket::bind("127.0.0.1:0")?;
-        let target = receiver.local_addr()?;
-        let sender = UdpSocket::bind("127.0.0.1:0")?;
+        let (_receiver, target, sender) = probe_rig()?;
 
         let mut dispatcher = PacketDispatcher::new();
         let ingress = dispatcher.add_capture(ingress_cap)?;
@@ -908,13 +919,11 @@ mod tests {
 
         let mut reactor = Reactor::new()?;
         sender.send_to(PROBE, target)?;
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while result.borrow().is_none() && Instant::now() < deadline {
-            dispatcher.drain_and_route(ingress, &mut reactor);
-            if result.borrow().is_none() {
-                std::thread::sleep(Duration::from_millis(20));
-            }
-        }
+        pump_until(
+            2,
+            || result.borrow().is_some(),
+            || dispatcher.drain_and_route(ingress, &mut reactor),
+        );
 
         let recorded = *result.borrow();
         let (addrs, sent_ok) = recorded.expect("the probe never fired");
