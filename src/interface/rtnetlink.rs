@@ -63,6 +63,33 @@ struct RtAttr {
     attr_type: u16,
 }
 
+/// Iterator over the `rtattr` TLVs of a message: yields `(attr_type, value)` per attribute,
+/// stopping at the first malformed length (as the kernel's own walk does).
+struct RtAttrs<'a> {
+    msg: &'a [u8],
+    at: usize,
+}
+
+/// The `rtattr` TLVs of `msg` starting at byte offset `from`.
+fn rtattrs(msg: &[u8], from: usize) -> RtAttrs<'_> {
+    RtAttrs { msg, at: from }
+}
+
+impl<'a> Iterator for RtAttrs<'a> {
+    type Item = (u16, &'a [u8]);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let rta = read_at::<RtAttr>(self.msg, self.at)?;
+        let rta_len = rta.len as usize;
+        if rta_len < size_of::<RtAttr>() || self.at + rta_len > self.msg.len() {
+            return None;
+        }
+        let data = &self.msg[self.at + size_of::<RtAttr>()..self.at + rta_len];
+        self.at += nl_align(rta_len);
+        Some((rta.attr_type, data))
+    }
+}
+
 /// `(n + 3) & !3` — netlink's 4-byte alignment for message and attribute lengths.
 pub(super) const fn nl_align(n: usize) -> usize {
     (n + 3) & !3
@@ -241,16 +268,8 @@ fn scan_addr(
     let mut local: Option<&[u8]> = None;
     let mut address: Option<&[u8]> = None;
     let mut flags = u32::from(body.flags);
-    let mut at = body_at + nl_align(size_of::<IfAddrMsg>());
-    while at + size_of::<RtAttr>() <= msg.len() {
-        // SAFETY: an attribute header lies within `msg` (bound checked).
-        let rta = unsafe { ptr::read_unaligned(msg.as_ptr().add(at).cast::<RtAttr>()) };
-        let rta_len = rta.len as usize;
-        if rta_len < size_of::<RtAttr>() || at + rta_len > msg.len() {
-            break;
-        }
-        let data = &msg[at + size_of::<RtAttr>()..at + rta_len];
-        match rta.attr_type {
+    for (attr_type, data) in rtattrs(msg, body_at + nl_align(size_of::<IfAddrMsg>())) {
+        match attr_type {
             libc::IFA_ADDRESS => address = Some(data),
             libc::IFA_LOCAL => local = Some(data),
             libc::IFA_FLAGS => {
@@ -261,7 +280,6 @@ fn scan_addr(
             }
             _ => {}
         }
-        at += nl_align(rta_len);
     }
 
     let Some(bytes) = local.or(address) else {
@@ -301,16 +319,8 @@ fn scan_link(msg: &[u8], if_name: &str, ifindex: u32, addrs: &mut InterfaceAddre
         return;
     }
 
-    let mut at = body_at + nl_align(size_of::<IfInfoMsg>());
-    while at + size_of::<RtAttr>() <= msg.len() {
-        // SAFETY: an attribute header lies within `msg` (bound checked).
-        let rta = unsafe { ptr::read_unaligned(msg.as_ptr().add(at).cast::<RtAttr>()) };
-        let rta_len = rta.len as usize;
-        if rta_len < size_of::<RtAttr>() || at + rta_len > msg.len() {
-            break;
-        }
-        let data = &msg[at + size_of::<RtAttr>()..at + rta_len];
-        if rta.attr_type == libc::IFLA_ADDRESS
+    for (attr_type, data) in rtattrs(msg, body_at + nl_align(size_of::<IfInfoMsg>())) {
+        if attr_type == libc::IFLA_ADDRESS
             && let Ok(mac) = <[u8; 6]>::try_from(data)
         {
             let mac = MacAddr::from(mac);
@@ -319,6 +329,5 @@ fn scan_link(msg: &[u8], if_name: &str, ifindex: u32, addrs: &mut InterfaceAddre
             // A link has a single L2 address; the rest of the message is irrelevant.
             return;
         }
-        at += nl_align(rta_len);
     }
 }
