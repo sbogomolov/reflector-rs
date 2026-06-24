@@ -146,35 +146,11 @@ fn self_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
 
     #[cfg(target_os = "macos")]
     {
-        set_cloexec_nonblock(read.as_raw_fd())?;
-        set_cloexec_nonblock(write.as_raw_fd())?;
+        crate::sys::set_cloexec_nonblock(read.as_raw_fd())?;
+        crate::sys::set_cloexec_nonblock(write.as_raw_fd())?;
     }
 
     Ok((read, write))
-}
-
-/// Set `FD_CLOEXEC` and `O_NONBLOCK` on `fd` (the macOS path, lacking `pipe2`).
-#[cfg(target_os = "macos")]
-fn set_cloexec_nonblock(fd: RawFd) -> io::Result<()> {
-    // SAFETY: `fd` is a valid open fd; F_GETFD returns the descriptor flags.
-    let fd_flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-    if fd_flags < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: `fd` is valid; F_SETFD writes the descriptor flags.
-    if unsafe { libc::fcntl(fd, libc::F_SETFD, fd_flags | libc::FD_CLOEXEC) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: `fd` is valid; F_GETFL returns the status flags.
-    let status = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if status < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: `fd` is valid; F_SETFL writes the status flags.
-    if unsafe { libc::fcntl(fd, libc::F_SETFL, status | libc::O_NONBLOCK) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
 }
 
 /// Install [`on_signal`] for every shutdown signal, returning the previous

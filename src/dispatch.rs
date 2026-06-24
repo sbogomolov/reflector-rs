@@ -22,7 +22,7 @@ use std::net::IpAddr;
 use std::os::fd::{AsRawFd, RawFd};
 
 use crate::capture::Capture;
-use crate::interface::{Interface, InterfaceAddresses};
+use crate::interface::{AddressMonitor, Interface, InterfaceAddresses};
 use crate::net::mac::MacAddr;
 use crate::net::packet::Packet;
 use crate::reactor::{Handler, Reactor, ReadyEvent};
@@ -32,6 +32,10 @@ use crate::reactor::{Handler, Reactor, ReadyEvent};
 /// re-reports the rest; BPF finishes its current userland batch past this, since the
 /// wait won't re-fire for those already-read records.
 const MAX_FRAMES_PER_EVENT: u32 = 64;
+
+/// The reactor `user_data` for the address monitor's fd. A [`CaptureKey`] packs a `u32`
+/// (via [`to_u64`](CaptureKey::to_u64)), so `u64::MAX` never collides with a real capture.
+const MONITOR_TAG: u64 = u64::MAX;
 
 /// A `Copy` handle to a capture the dispatcher owns: an index into the interface table's
 /// captures. A newtype, not a bare alias — so it can't be passed where an [`InterfaceKey`]
@@ -223,6 +227,37 @@ impl InterfaceTable {
         }
     }
 
+    /// Re-resolve the interface with kernel index `ifindex`, in place. A real index matches at
+    /// most one interface — they dedup by name, and the kernel gives each a distinct index —
+    /// so this finds rather than scans. Returns whether one matched; a change on an interface
+    /// we don't watch is `Ok(false)`. Log-free, like [`take`](Self::take); the dispatcher
+    /// reports the outcome. (The caller routes the `0` overflow-signal to [`refresh_all`], so
+    /// `ifindex` is always a real index here.)
+    ///
+    /// [`refresh_all`]: Self::refresh_all
+    ///
+    /// # Errors
+    /// Propagates a resolution syscall failure.
+    fn refresh_by_ifindex(&mut self, ifindex: u32) -> io::Result<bool> {
+        let Some(iface) = self.interfaces.iter_mut().find(|i| i.ifindex == ifindex) else {
+            return Ok(false);
+        };
+        iface.refresh()?;
+        Ok(true)
+    }
+
+    /// Re-resolve every interface in place — the response to an overflow signal, where
+    /// dropped notifications mean any address could be stale.
+    ///
+    /// # Errors
+    /// Propagates the first resolution syscall failure.
+    fn refresh_all(&mut self) -> io::Result<()> {
+        for iface in &mut self.interfaces {
+            iface.refresh()?;
+        }
+        Ok(())
+    }
+
     /// Each present capture's `(fd, user_data = CaptureKey)` for
     /// [`Reactor::register_with_fds`].
     fn capture_watches(&self) -> Vec<(RawFd, u64)> {
@@ -245,14 +280,35 @@ impl InterfaceTable {
 pub(crate) struct PacketDispatcher {
     table: InterfaceTable,
     registrations: Vec<Registration>,
+    /// The address-change monitor, opened best-effort in [`new`](Self::new). `None` is a
+    /// degraded mode: addresses stay at their startup-resolved values.
+    monitor: Option<AddressMonitor>,
 }
 
 impl PacketDispatcher {
-    /// An empty dispatcher.
+    /// A dispatcher with no captures yet. Opens the address monitor up front — before the
+    /// first [`add_capture`](Self::add_capture) resolve — so a change during startup is
+    /// already queued rather than missed.
     pub(crate) fn new() -> Self {
         Self {
             table: InterfaceTable::new(),
             registrations: Vec::new(),
+            monitor: Self::open_monitor(),
+        }
+    }
+
+    /// Open the address-change monitor. Best-effort: a failure logs and yields `None` — the
+    /// daemon then runs on its startup-resolved addresses (no live updates), never aborting.
+    fn open_monitor() -> Option<AddressMonitor> {
+        match AddressMonitor::open() {
+            Ok(monitor) => {
+                log::debug!("address monitor installed");
+                Some(monitor)
+            }
+            Err(e) => {
+                log::warn!("address monitor unavailable; addresses won't refresh on change: {e}");
+                None
+            }
         }
     }
 
@@ -273,9 +329,14 @@ impl PacketDispatcher {
 
     /// Each capture's `(fd, user_data)` for [`Reactor::register_with_fds`]: the reactor
     /// watches them all under the dispatcher's one handler key, tagging each with its
-    /// [`CaptureKey`] so `on_readable` recovers the capture without a lookup.
+    /// [`CaptureKey`] so `on_readable` recovers the capture without a lookup. The address
+    /// monitor's fd, when it opened, rides along under [`MONITOR_TAG`].
     pub(crate) fn capture_watches(&self) -> Vec<(RawFd, u64)> {
-        self.table.capture_watches()
+        let mut watches = self.table.capture_watches();
+        if let Some(monitor) = &self.monitor {
+            watches.push((monitor.as_raw_fd(), MONITOR_TAG));
+        }
+        watches
     }
 
     /// Register `handler`, gated by `filter`, for packets captured on `ingress`.
@@ -398,14 +459,53 @@ impl PacketDispatcher {
             }
         }
     }
+
+    /// Drain the address monitor and re-resolve each interface a notification names,
+    /// coalescing duplicates so one interface re-resolves at most once per wakeup. A `0`
+    /// (the overflow signal) re-resolves every interface. Best-effort: a read or resolution
+    /// failure logs and is dropped — the daemon keeps its last-known addresses.
+    fn refresh_changed_interfaces(&mut self) {
+        let Some(monitor) = self.monitor.as_mut() else {
+            return;
+        };
+        let mut changed: Vec<u32> = Vec::new();
+        if let Err(e) = monitor.drain(|ifindex| {
+            if !changed.contains(&ifindex) {
+                changed.push(ifindex);
+            }
+        }) {
+            log::warn!("address monitor read failed; skipping refresh: {e}");
+            return;
+        }
+        // 0 is the overflow signal: notifications were dropped, so re-resolve everything.
+        if changed.contains(&0) {
+            log::debug!("address monitor overflow; re-resolving all interfaces");
+            if let Err(e) = self.table.refresh_all() {
+                log::warn!("re-resolving all interfaces failed: {e}");
+            }
+            return;
+        }
+        for ifindex in changed {
+            match self.table.refresh_by_ifindex(ifindex) {
+                Ok(true) => log::debug!("re-resolved interface (ifindex {ifindex}) after a change"),
+                Ok(false) => {} // a change on an interface we don't watch
+                Err(e) => log::warn!("re-resolving ifindex {ifindex} failed: {e}"),
+            }
+        }
+    }
 }
 
 impl Handler for PacketDispatcher {
-    /// `event.user_data` is the ready capture's [`CaptureKey`] (tagged at registration),
-    /// so drain that capture directly — no fd lookup. A bad value resolves to a stale key
-    /// and is a logged drop in [`drain_and_route`](Self::drain_and_route).
+    /// [`MONITOR_TAG`] routes to an address-monitor drain; otherwise `event.user_data` is the
+    /// ready capture's [`CaptureKey`] (tagged at registration), so drain that capture
+    /// directly — no fd lookup. A bad capture value resolves to a stale key and is a logged
+    /// drop in [`drain_and_route`](Self::drain_and_route).
     fn on_readable(&mut self, event: ReadyEvent, reactor: &mut Reactor) {
-        self.drain_and_route(CaptureKey::from_u64(event.user_data), reactor);
+        if event.user_data == MONITOR_TAG {
+            self.refresh_changed_interfaces();
+        } else {
+            self.drain_and_route(CaptureKey::from_u64(event.user_data), reactor);
+        }
     }
 }
 
@@ -830,6 +930,44 @@ mod tests {
         assert!(
             sent_ok,
             "send to the taken-out ingress must drop (Ok), not panic"
+        );
+        Ok(())
+    }
+
+    // new() opens the routing socket; its fd joins the watch list under the sentinel tag,
+    // distinct from any capture key. Best-effort: the watch appears only if the socket opened
+    // (some sandboxes deny it), so an empty watch list means skip.
+    #[test]
+    fn monitor_fd_is_watched_under_the_sentinel_tag() {
+        let dispatcher = PacketDispatcher::new();
+        let watches = dispatcher.capture_watches();
+        if watches.is_empty() {
+            eprintln!("skip: the routing socket could not be opened in this environment");
+            return;
+        }
+        // No captures were added, so the monitor fd is the sole watch, under MONITOR_TAG.
+        assert_eq!(watches.len(), 1, "only the monitor fd should be watched");
+        assert_eq!(
+            watches[0].1, MONITOR_TAG,
+            "the monitor fd must carry MONITOR_TAG"
+        );
+    }
+
+    // refresh_by_ifindex re-resolves only the interface(s) with the matching kernel index.
+    // Resolution is unprivileged (no capture needed), so this exercises the monitor's refresh
+    // path without CAP_NET_RAW.
+    #[test]
+    fn refresh_by_ifindex_targets_the_matching_interface() -> io::Result<()> {
+        let mut dispatcher = PacketDispatcher::new();
+        dispatcher.table.find_or_add_interface(LOOPBACK)?;
+        let ifindex = crate::interface::if_index(LOOPBACK).expect("loopback has an ifindex");
+        assert!(
+            dispatcher.table.refresh_by_ifindex(ifindex)?,
+            "the loopback interface should match its ifindex and re-resolve",
+        );
+        assert!(
+            !dispatcher.table.refresh_by_ifindex(u32::MAX)?,
+            "an ifindex we don't watch should refresh nothing",
         );
         Ok(())
     }

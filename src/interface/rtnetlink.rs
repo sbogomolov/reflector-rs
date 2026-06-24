@@ -1,9 +1,8 @@
-//! Linux address resolution, pure netlink: one `RTM_GETADDR` dump for the v4/v6 addresses
-//! (each carrying its `IFA_FLAGS`, so tentative / deprecated / dadfailed are filtered
-//! inline) and one `RTM_GETLINK` dump for the MAC. The netlink message layer is
+//! Linux address resolution over rtnetlink (`NETLINK_ROUTE`): one `RTM_GETADDR` dump for the
+//! v4/v6 addresses (each carrying its `IFA_FLAGS`, so tentative / deprecated / dadfailed are
+//! filtered inline) and one `RTM_GETLINK` dump for the MAC. The netlink message framing is
 //! hand-rolled — `libc` exposes it for Android only, not glibc/musl.
 
-use std::ffi::CString;
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -22,37 +21,37 @@ const NLMSG_ERROR: u16 = 0x02;
 /// `IFA_F_*` bits that disqualify a v6 address as a source.
 const IFA_F_UNUSABLE: u32 = 0x40 | 0x20 | 0x08; // TENTATIVE | DEPRECATED | DADFAILED
 
-/// `struct nlmsghdr`.
+/// `struct nlmsghdr`. Shared with the address monitor (`len`/`msg_type` drive its walk).
 #[repr(C)]
-struct NlMsgHdr {
-    len: u32,
-    msg_type: u16,
+pub(super) struct NlMsgHdr {
+    pub(super) len: u32,
+    pub(super) msg_type: u16,
     flags: u16,
     seq: u32,
     pid: u32,
 }
 
 /// `struct ifaddrmsg` — the body of an `RTM_*ADDR` message. A zeroed value (family
-/// `AF_UNSPEC`) is the dump request body.
+/// `AF_UNSPEC`) is the dump request body. The address monitor reads `index` from it.
 #[repr(C)]
 #[derive(Default)]
-struct IfAddrMsg {
+pub(super) struct IfAddrMsg {
     family: u8,
     prefixlen: u8,
     flags: u8,
     scope: u8,
-    index: u32,
+    pub(super) index: u32,
 }
 
 /// `struct ifinfomsg` — the body of an `RTM_*LINK` message. A zeroed value is the dump
-/// request body.
+/// request body. The address monitor reads `index` from it.
 #[repr(C)]
 #[derive(Default)]
-struct IfInfoMsg {
+pub(super) struct IfInfoMsg {
     family: u8,
     pad: u8,
     dev_type: u16,
-    index: i32,
+    pub(super) index: i32,
     flags: u32,
     change: u32,
 }
@@ -65,24 +64,20 @@ struct RtAttr {
 }
 
 /// `(n + 3) & !3` — netlink's 4-byte alignment for message and attribute lengths.
-const fn nl_align(n: usize) -> usize {
+pub(super) const fn nl_align(n: usize) -> usize {
     (n + 3) & !3
 }
 
-/// Resolve `if_name`'s current source addresses with two netlink dumps: `RTM_GETADDR` for
-/// v4/v6 (flag-filtered, link-local > ULA > global) and `RTM_GETLINK` for the MAC.
+/// Resolve interface `ifindex`'s current source addresses with two netlink dumps:
+/// `RTM_GETADDR` for v4/v6 (flag-filtered, link-local > ULA > global) and `RTM_GETLINK` for
+/// the MAC. `if_name` is for tracing only; the dumps are filtered by `ifindex`. A `0`
+/// `ifindex` (the caller's "unknown interface" sentinel) skips the dumps.
 ///
 /// # Errors
-/// Returns an error if a netlink socket, request, or reply fails. An unknown interface
-/// yields an all-absent [`InterfaceAddresses`].
-pub(crate) fn resolve(if_name: &str) -> io::Result<InterfaceAddresses> {
-    let Ok(cname) = CString::new(if_name) else {
-        return Ok(InterfaceAddresses::default()); // a NUL in the name names no interface
-    };
-    // SAFETY: `cname` is a valid NUL-terminated C string.
-    let ifindex = unsafe { libc::if_nametoindex(cname.as_ptr()) };
+/// Returns an error if a netlink socket, request, or reply fails.
+pub(super) fn resolve(if_name: &str, ifindex: u32) -> io::Result<InterfaceAddresses> {
     if ifindex == 0 {
-        return Ok(InterfaceAddresses::default()); // unknown interface
+        return Ok(InterfaceAddresses::default()); // unknown interface — nothing to dump
     }
 
     let sock = netlink_socket()?;

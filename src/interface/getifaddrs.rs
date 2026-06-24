@@ -23,7 +23,7 @@ const IN6_IFF_UNUSABLE: c_int = 0x02 | 0x04 | 0x10; // TENTATIVE | DUPLICATED | 
 /// # Errors
 /// Returns an error only if `getifaddrs` fails; an unknown interface (or one with no
 /// addresses yet) yields an all-absent [`InterfaceAddresses`].
-pub(crate) fn resolve(if_name: &str) -> io::Result<InterfaceAddresses> {
+pub(super) fn resolve(if_name: &str) -> io::Result<InterfaceAddresses> {
     // One socket for the per-v6 `SIOCGIFAFLAG_IN6` ioctl; no IPv6 stack just means no v6.
     let v6_sock = inet6_socket();
 

@@ -7,6 +7,7 @@
 mod config;
 mod error;
 mod logging;
+mod sys;
 // `net`/`capture`/`dispatch` have no caller until the reflectors are built, and a
 // few reactor APIs (set_write_interest, is_registered) have none until then. Allow
 // dead code until the data path lands.
