@@ -68,6 +68,18 @@ pub(super) const fn nl_align(n: usize) -> usize {
     (n + 3) & !3
 }
 
+/// Read a `repr(C)` POD `T` at `off` in `buf`, or `None` if `buf` is too short (or `off`
+/// overflows). Tolerates any alignment. `T` must be a plain wire struct — no padding-sensitive
+/// invariants, no `Drop`; the netlink headers/bodies all qualify.
+pub(super) fn read_at<T>(buf: &[u8], off: usize) -> Option<T> {
+    if off.checked_add(size_of::<T>())? > buf.len() {
+        return None;
+    }
+    // SAFETY: the bound check guarantees a full `T` lies within `buf`; `read_unaligned` imposes
+    // no alignment requirement, and `T` is a plain wire struct.
+    Some(unsafe { ptr::read_unaligned(buf.as_ptr().add(off).cast::<T>()) })
+}
+
 /// Resolve interface `ifindex`'s current source addresses with two netlink dumps:
 /// `RTM_GETADDR` for v4/v6 (flag-filtered, link-local > ULA > global) and `RTM_GETLINK` for
 /// the MAC. `if_name` is for tracing only; the dumps are filtered by `ifindex`. A `0`
@@ -189,9 +201,7 @@ fn dump<B>(
         let received = usize::try_from(received).expect("recv count is non-negative");
 
         let mut offset = 0;
-        while offset + size_of::<NlMsgHdr>() <= received {
-            // SAFETY: a full header lies within `buf[..received]` (bound checked).
-            let hdr = unsafe { ptr::read_unaligned(buf.as_ptr().add(offset).cast::<NlMsgHdr>()) };
+        while let Some(hdr) = read_at::<NlMsgHdr>(&buf[..received], offset) {
             let len = hdr.len as usize;
             if len < size_of::<NlMsgHdr>() || offset + len > received {
                 break;
@@ -217,11 +227,9 @@ fn scan_addr(
     best_v6_rank: &mut u8,
 ) {
     let body_at = nl_align(size_of::<NlMsgHdr>());
-    if body_at + size_of::<IfAddrMsg>() > msg.len() {
+    let Some(body) = read_at::<IfAddrMsg>(msg, body_at) else {
         return;
-    }
-    // SAFETY: the `ifaddrmsg` body lies within `msg` (bound checked).
-    let body = unsafe { ptr::read_unaligned(msg.as_ptr().add(body_at).cast::<IfAddrMsg>()) };
+    };
     let family = c_int::from(body.family);
     if body.index != ifindex || (family != libc::AF_INET && family != libc::AF_INET6) {
         return;
@@ -286,11 +294,9 @@ fn scan_addr(
 /// record it as the MAC. `msg` spans one netlink message.
 fn scan_link(msg: &[u8], if_name: &str, ifindex: u32, addrs: &mut InterfaceAddresses) {
     let body_at = nl_align(size_of::<NlMsgHdr>());
-    if body_at + size_of::<IfInfoMsg>() > msg.len() {
+    let Some(body) = read_at::<IfInfoMsg>(msg, body_at) else {
         return;
-    }
-    // SAFETY: the `ifinfomsg` body lies within `msg` (bound checked).
-    let body = unsafe { ptr::read_unaligned(msg.as_ptr().add(body_at).cast::<IfInfoMsg>()) };
+    };
     if u32::try_from(body.index).ok() != Some(ifindex) {
         return;
     }

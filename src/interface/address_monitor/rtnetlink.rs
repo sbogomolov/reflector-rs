@@ -4,11 +4,10 @@
 
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::ptr;
 
 use libc::{c_int, socklen_t};
 
-use super::super::rtnetlink::{IfAddrMsg, IfInfoMsg, NlMsgHdr, nl_align};
+use super::super::rtnetlink::{IfAddrMsg, IfInfoMsg, NlMsgHdr, nl_align, read_at};
 
 const NETLINK_ROUTE: c_int = 0;
 
@@ -67,9 +66,7 @@ pub(super) fn open() -> io::Result<OwnedFd> {
 /// `RTM_{NEW,DEL}ADDR` (from its `ifaddrmsg`) and `RTM_{NEW,DEL}LINK` (from its `ifinfomsg`).
 pub(super) fn for_each_change(buf: &[u8], on_change: &mut impl FnMut(u32)) {
     let mut offset = 0;
-    while offset + size_of::<NlMsgHdr>() <= buf.len() {
-        // SAFETY: a full header lies within `buf` (bound checked).
-        let hdr = unsafe { ptr::read_unaligned(buf.as_ptr().add(offset).cast::<NlMsgHdr>()) };
+    while let Some(hdr) = read_at::<NlMsgHdr>(buf, offset) {
         let len = hdr.len as usize;
         if len < size_of::<NlMsgHdr>() || offset + len > buf.len() {
             // Not a normal end (that's the `while` running out): a message claims a length
@@ -84,18 +81,16 @@ pub(super) fn for_each_change(buf: &[u8], on_change: &mut impl FnMut(u32)) {
         let body_at = offset + nl_align(size_of::<NlMsgHdr>());
         let end = offset + len;
         match hdr.msg_type {
-            libc::RTM_NEWADDR | libc::RTM_DELADDR if body_at + size_of::<IfAddrMsg>() <= end => {
-                // SAFETY: the `ifaddrmsg` body lies within this message (bound checked).
-                let body =
-                    unsafe { ptr::read_unaligned(buf.as_ptr().add(body_at).cast::<IfAddrMsg>()) };
-                report(body.index, on_change);
+            libc::RTM_NEWADDR | libc::RTM_DELADDR => {
+                if let Some(body) = read_at::<IfAddrMsg>(&buf[..end], body_at) {
+                    report(body.index, on_change);
+                }
             }
-            libc::RTM_NEWLINK | libc::RTM_DELLINK if body_at + size_of::<IfInfoMsg>() <= end => {
-                // SAFETY: the `ifinfomsg` body lies within this message (bound checked).
-                let body =
-                    unsafe { ptr::read_unaligned(buf.as_ptr().add(body_at).cast::<IfInfoMsg>()) };
+            libc::RTM_NEWLINK | libc::RTM_DELLINK => {
                 // `ifi_index` is i32 but always a positive kernel index.
-                if let Ok(index) = u32::try_from(body.index) {
+                if let Some(body) = read_at::<IfInfoMsg>(&buf[..end], body_at)
+                    && let Ok(index) = u32::try_from(body.index)
+                {
                     report(index, on_change);
                 }
             }
