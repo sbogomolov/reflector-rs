@@ -36,11 +36,14 @@ struct GroupReq {
 
 /// One capture interface's multicast memberships: one unbound `SOCK_DGRAM` fd per family, opened on
 /// that family's first join. The interface index is fixed at construction, so every membership on
-/// these two sockets belongs to this one interface. Held for membership only.
+/// these two sockets belongs to this one interface. `desired` records the groups asked for so they
+/// can be re-attempted when the interface re-resolves (a v4 group joined before its address existed
+/// becomes joinable then). Held for membership only.
 pub(crate) struct MulticastJoiner {
     ifindex: u32,
     v4: Option<OwnedFd>,
     v6: Option<OwnedFd>,
+    desired: Vec<IpAddr>,
 }
 
 impl MulticastJoiner {
@@ -49,19 +52,44 @@ impl MulticastJoiner {
             ifindex,
             v4: None,
             v6: None,
+            desired: Vec::new(),
         }
     }
 
-    /// Join `group` on this interface, idempotently: the kernel keys memberships by `(group,
-    /// ifindex)`, so re-joining one already held is a no-op — the dynamic re-attempt after an
-    /// address comes up or an interface bounces relies on this.
+    /// Join `group` on this interface and remember it, so a later interface change re-attempts it.
+    /// Idempotent: the kernel keys memberships by `(group, ifindex)`, so re-joining one already held
+    /// is a no-op.
     ///
     /// # Errors
     /// Returns the OS error if the join socket can't be opened or the membership can't be added.
-    /// `EADDRNOTAVAIL` means the interface is transiently down, so the caller should retry on the
-    /// next up-event rather than treat it as fatal. (`ENOBUFS` — the per-socket membership cap —
+    /// `EADDRNOTAVAIL` means the interface has no address of that family yet — the membership is
+    /// recorded and [`rejoin`](Self::rejoin) retries it on the next address-up event, so the caller
+    /// can treat it as deferred rather than fatal. (`ENOBUFS` — the per-socket membership cap —
     /// can't arise: this socket holds only this interface's few groups; see the module note.)
     pub(crate) fn join(&mut self, group: IpAddr) -> io::Result<()> {
+        if !self.desired.contains(&group) {
+            self.desired.push(group);
+        }
+        self.apply(group)
+    }
+
+    /// Re-attempt every desired membership after the interface re-resolves: a group that wasn't
+    /// joinable before its address existed succeeds now, an already-held one is a harmless no-op.
+    /// Best-effort — a still-unavailable family logs and waits for the next change.
+    pub(crate) fn rejoin(&mut self) {
+        for i in 0..self.desired.len() {
+            let group = self.desired[i];
+            if let Err(e) = self.apply(group) {
+                log::debug!(
+                    "re-join of {group} on ifindex {} deferred: {e}",
+                    self.ifindex
+                );
+            }
+        }
+    }
+
+    /// Issue `MCAST_JOIN_GROUP` for `group` on this interface's per-family socket.
+    fn apply(&mut self, group: IpAddr) -> io::Result<()> {
         let (slot, family, level) = match group {
             IpAddr::V4(_) => (&mut self.v4, libc::AF_INET, libc::IPPROTO_IP),
             IpAddr::V6(_) => (&mut self.v6, libc::AF_INET6, libc::IPPROTO_IPV6),

@@ -27,6 +27,7 @@ use std::os::fd::{AsRawFd, RawFd};
 
 use thiserror::Error;
 
+use self::multicast::MulticastJoiner;
 use crate::capture::Capture;
 use crate::interface::{AddressMonitor, Interface, InterfaceAddresses};
 use crate::net::LinkType;
@@ -135,6 +136,9 @@ struct CaptureEntry {
 /// and the inner `Option<Capture>` alone marks the take-out.
 struct InterfaceTable {
     interfaces: Vec<Interface>,
+    /// One multicast joiner per interface, index-aligned with `interfaces` (an [`InterfaceKey`]
+    /// keys both). The interface's ifindex is stable for its lifetime, so each joiner bakes it.
+    joiners: Vec<MulticastJoiner>,
     captures: Vec<CaptureEntry>,
 }
 
@@ -142,6 +146,7 @@ impl InterfaceTable {
     fn new() -> Self {
         Self {
             interfaces: Vec::new(),
+            joiners: Vec::new(),
             captures: Vec::new(),
         }
     }
@@ -150,8 +155,21 @@ impl InterfaceTable {
     fn add_interface(&mut self, interface: Interface) -> InterfaceKey {
         let key =
             InterfaceKey(u32::try_from(self.interfaces.len()).expect("interface count fits a u32"));
+        self.joiners.push(MulticastJoiner::new(interface.ifindex));
         self.interfaces.push(interface);
         key
+    }
+
+    /// Join `group`'s multicast membership on `interface`, recording it for re-attempt on a later
+    /// address change. # Errors: propagates the joiner's OS error (an unavailable family is
+    /// deferred to [`rejoin`](MulticastJoiner::rejoin), not an error).
+    fn join_on(&mut self, interface: InterfaceKey, group: IpAddr) -> io::Result<()> {
+        // `joiners` is index-aligned with `interfaces` (pushed together, insert-only), so an
+        // `InterfaceKey` always indexes a joiner; a miss would be a desync bug, not a runtime case.
+        self.joiners
+            .get_mut(interface.0 as usize)
+            .expect("an InterfaceKey always indexes a joiner")
+            .join(group)
     }
 
     /// The key of the interface named `name`, opening and resolving it if absent — so
@@ -247,10 +265,13 @@ impl InterfaceTable {
     /// # Errors
     /// Propagates a resolution syscall failure.
     fn refresh_by_ifindex(&mut self, ifindex: u32) -> io::Result<bool> {
-        let Some(iface) = self.interfaces.iter_mut().find(|i| i.ifindex == ifindex) else {
+        let Some(idx) = self.interfaces.iter().position(|i| i.ifindex == ifindex) else {
             return Ok(false);
         };
-        iface.refresh()?;
+        self.interfaces[idx].refresh()?;
+        // Re-resolved addresses may have made a deferred join (a v4 group that had no address)
+        // viable; re-attempt this interface's memberships.
+        self.joiners[idx].rejoin();
         Ok(true)
     }
 
@@ -262,6 +283,9 @@ impl InterfaceTable {
     fn refresh_all(&mut self) -> io::Result<()> {
         for iface in &mut self.interfaces {
             iface.refresh()?;
+        }
+        for joiner in &mut self.joiners {
+            joiner.rejoin();
         }
         Ok(())
     }
@@ -359,6 +383,22 @@ impl PacketDispatcher {
             filter,
             handler: Some(handler),
         });
+    }
+
+    /// Join `group`'s multicast membership on the interface behind `capture`, so the raw capture
+    /// is admitted the group's frames. Records the group for re-attempt when the interface's
+    /// addresses next change. A reflector calls this at build, once per group per interface.
+    ///
+    /// # Errors
+    /// Propagates the join's OS error. A family with no address yet is *not* an error — it's
+    /// recorded and retried on the next address-up event; only a hard failure surfaces here.
+    #[allow(dead_code)] // wired in when the mDNS reflector lands
+    pub(crate) fn join_group(&mut self, capture: CaptureKey, group: IpAddr) -> io::Result<()> {
+        let Some(interface) = self.table.interface_of(capture) else {
+            log::warn!("join_group: capture {capture:?} unknown; group {group} not joined");
+            return Ok(());
+        };
+        self.table.join_on(interface, group)
     }
 
     /// Inject `frame` on the capture `egress` addresses.
@@ -1293,5 +1333,32 @@ mod tests {
             "an ifindex we don't watch should refresh nothing",
         );
         Ok(())
+    }
+
+    // join_on records a group on the interface's joiner and joins it; a later refresh re-attempts
+    // the recorded memberships idempotently. Unprivileged: loopback accepts the join and resolving
+    // the interface needs no CAP_NET_RAW.
+    #[test]
+    fn join_on_records_a_membership_and_refresh_re_attempts_it() -> io::Result<()> {
+        let mut dispatcher = PacketDispatcher::new();
+        let iface = dispatcher.table.find_or_add_interface(LOOPBACK_IFACE)?;
+        dispatcher
+            .table
+            .join_on(iface, IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251)))?;
+        dispatcher.table.join_on(
+            iface,
+            IpAddr::V6(Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0xfb)),
+        )?;
+        // The recorded memberships survive a refresh, re-attempted idempotently (no error).
+        dispatcher.table.refresh_all()?;
+        Ok(())
+    }
+
+    // A join_group on an unknown capture is logged and skipped — not an error or a panic.
+    #[test]
+    fn join_group_ignores_an_unknown_capture() {
+        let mut dispatcher = PacketDispatcher::new();
+        let group = IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251));
+        assert!(dispatcher.join_group(CaptureKey(9999), group).is_ok());
     }
 }
