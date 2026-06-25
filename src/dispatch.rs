@@ -72,7 +72,7 @@ impl CaptureKey {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct InterfaceKey(u32);
 
-/// An optional-field packet filter (the C++ `PacketFilter` parity): an unset field
+/// An optional-field packet filter: an unset field
 /// matches anything. A `src_mac`/`dst_mac` filter never matches a `DLT_NULL` packet,
 /// which has no L2 addresses.
 #[derive(Clone, Copy, Default)]

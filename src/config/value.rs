@@ -79,8 +79,8 @@ impl AddressFamily {
     }
 
     /// Whether a v4 source must be present at startup, else the reflector fails to build. The
-    /// same set as [`uses_ipv4`](Self::uses_ipv4) — v4 is the baseline — but a distinct concept
-    /// (the C++ `RequiresIPv4`): `Default` requires v4 even while treating v6 as best-effort.
+    /// same set as [`uses_ipv4`](Self::uses_ipv4) — v4 is the baseline — but a distinct concept:
+    /// `Default` requires v4 even while treating v6 as best-effort.
     #[must_use]
     pub(crate) fn requires_ipv4(self) -> bool {
         matches!(self, Self::Default | Self::Dual | Self::Ipv4)
@@ -88,7 +88,7 @@ impl AddressFamily {
 
     /// Whether a v6 source must be present at startup, else the reflector fails to build — only
     /// `Dual` and `Ipv6`. Unlike [`uses_ipv6`](Self::uses_ipv6), `Default` does not require v6:
-    /// it reflects v6 when available but starts without it (the C++ `RequiresIPv6`).
+    /// it reflects v6 when available but starts without it.
     #[must_use]
     pub(crate) fn requires_ipv6(self) -> bool {
         matches!(self, Self::Dual | Self::Ipv6)
