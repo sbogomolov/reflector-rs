@@ -14,11 +14,11 @@ use std::ffi::CString;
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 
-use libc::{c_int, c_void, socklen_t};
+use libc::{c_int, c_void};
 
 use super::filter::{BpfInsn, DROP_OUTGOING_PROLOGUE, ETHERNET_UDP_FILTER};
 use crate::net::LinkType;
-use crate::sys::RecvOutcome;
+use crate::sys::{RecvOutcome, socklen_of};
 
 /// Receive buffer sized for one frame at a typical Ethernet MTU plus headers.
 const RECV_BUFFER_SIZE: usize = 4096;
@@ -275,11 +275,6 @@ fn bind_interface(fd: &OwnedFd, mut addr: libc::sockaddr_ll) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
-}
-
-/// The size of `T` as a `socklen_t`, for `setsockopt`/`bind` length arguments.
-fn socklen_of<T>() -> socklen_t {
-    socklen_t::try_from(size_of::<T>()).expect("option/address size fits socklen_t")
 }
 
 #[cfg(test)]

@@ -17,6 +17,10 @@
 //! [`drain_and_route`]: PacketDispatcher::drain_and_route
 //! [`send`]: PacketDispatcher::send
 
+// The multicast-join capability (mDNS/SSDP); allow dead code until a reflector joins a group.
+#[allow(dead_code)]
+mod multicast;
+
 use std::io;
 use std::net::{IpAddr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::fd::{AsRawFd, RawFd};

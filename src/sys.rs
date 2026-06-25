@@ -5,6 +5,8 @@
 use std::io;
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 
+use libc::socklen_t;
+
 /// Take ownership of a raw fd returned by a fd-returning syscall: a negative value is the
 /// POSIX error sentinel; a non-negative one is a fresh fd we own.
 ///
@@ -49,6 +51,11 @@ pub(crate) fn classify_recv(n: isize) -> io::Result<RecvOutcome> {
         return Ok(RecvOutcome::WouldBlock);
     }
     Err(err)
+}
+
+/// The size of `T` as a `socklen_t`, for `setsockopt`/`bind` length arguments.
+pub(crate) fn socklen_of<T>() -> socklen_t {
+    socklen_t::try_from(size_of::<T>()).expect("option/address size fits socklen_t")
 }
 
 /// Set `FD_CLOEXEC` and `O_NONBLOCK` on `fd`, read-modify-write so any other flags survive.
