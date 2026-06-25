@@ -4,31 +4,30 @@
 //! The behavior lives in this library crate so it stays testable in-process;
 //! the binary (`src/main.rs`) is a thin shim over [`run`].
 
-mod config;
-mod error;
-mod logging;
-mod sys;
-// `net`/`capture`/`dispatch`/`reflector` have no caller until `run()` wires the data
-// path, and a few reactor APIs (set_write_interest, is_registered) have none until
-// then. Allow dead code until that lands.
-#[allow(dead_code)]
 mod capture;
-#[allow(dead_code)]
+mod config;
 mod dispatch;
-#[allow(dead_code)]
+mod error;
 mod interface;
-#[allow(dead_code)]
+mod logging;
 mod net;
+// The reactor is a complete reactor; the synchronous-send WoL data path drives only a subset.
+// Its write-interest path (set_write_interest, unwatch, ReadyEvent's reg_key/fd) awaits the DIAL
+// TCP proxy, and a couple of utilities (the arena's iter, the self-pipe's RAII write end) have no
+// caller yet. Allow dead code in the module until those land.
 #[allow(dead_code)]
 mod reactor;
-#[allow(dead_code)]
 mod reflector;
+mod sys;
 
 pub use self::error::{Error, Result};
 pub use self::logging::init as init_logging;
 
+use self::capture::Capture;
 use self::config::Config;
+use self::dispatch::PacketDispatcher;
 use self::reactor::Reactor;
+use self::reflector::InterfaceMap;
 
 /// Run the reflector to completion.
 ///
@@ -60,11 +59,41 @@ pub fn run(args: &[String]) -> Result<()> {
         if count == 1 { "" } else { "s" }
     );
 
-    // The capture layer and reflectors will register their fds here; for now the
-    // reactor carries only its shutdown self-pipe, so run() blocks until a signal.
+    // Build the data path: one capture per interface, the reflectors that bridge them, then
+    // hand the dispatcher to the reactor to drive until a shutdown signal.
+    let mut dispatcher = PacketDispatcher::new();
+    let interfaces = open_captures(&config, &mut dispatcher)?;
+    for reflector in &config.reflectors {
+        crate::reflector::wol::build(reflector, &interfaces, &mut dispatcher)
+            .map_err(|e| Error::reflector(reflector.name.as_str(), e))?;
+    }
+
     let mut reactor = Reactor::new()?;
+    let watches = dispatcher.capture_watches();
+    reactor.register_with_fds(Box::new(dispatcher), &watches)?;
     log::info!("running; press Ctrl-C or send SIGTERM to stop");
     reactor.run()?;
     log::info!("stopped");
     Ok(())
+}
+
+/// Open one capture per distinct interface — the `source ∪ target` of every reflector, in
+/// first-seen order — recording each in an [`InterfaceMap`] for the per-protocol builders.
+/// Fail-closed: a capture that can't open (missing `CAP_NET_RAW`, an absent interface) aborts
+/// startup, since a daemon that looks healthy but reflects nothing is the worse failure.
+fn open_captures(config: &Config, dispatcher: &mut PacketDispatcher) -> Result<InterfaceMap> {
+    let mut interfaces = InterfaceMap::default();
+    for reflector in &config.reflectors {
+        for name in [reflector.source_if.as_str(), reflector.target_if.as_str()] {
+            if interfaces.key_for(name).is_some() {
+                continue;
+            }
+            let capture = Capture::open(name).map_err(|e| Error::capture(name, e))?;
+            let key = dispatcher
+                .add_capture(capture)
+                .map_err(|e| Error::capture(name, e))?;
+            interfaces.insert(name.to_owned(), key);
+        }
+    }
+    Ok(interfaces)
 }

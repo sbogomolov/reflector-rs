@@ -11,6 +11,7 @@ use std::io;
 use thiserror::Error;
 
 use crate::config::ConfigError;
+use crate::reflector::BuildError;
 
 /// Crate-wide result alias, so signatures read `Result<T>` instead of
 /// `Result<T, crate::Error>`.
@@ -31,10 +32,37 @@ enum ErrorKind {
     /// Configuration could not be loaded or failed validation.
     #[error("config: {0}")]
     Config(#[from] ConfigError),
+    /// A capture could not be opened (no `CAP_NET_RAW`, or the interface is absent) or its
+    /// interface could not be resolved. Built explicitly — not via the blanket `From` below —
+    /// so capture setup reads as such, not as a reactor failure.
+    #[error("cannot capture on {iface}: {source}")]
+    Capture { iface: String, source: io::Error },
+    /// A reflector could not be built from its config (an unknown interface, or a target that
+    /// can't currently send a required family).
+    #[error("reflector \"{name}\": {source}")]
+    Reflector { name: String, source: BuildError },
     /// A reactor or syscall failure. The reactor is currently the crate's only
     /// source of a raw `io::Error`, so the blanket `From` below lands here.
     #[error("reactor: {0}")]
     Reactor(#[from] io::Error),
+}
+
+impl Error {
+    /// A capture on `iface` could not be set up (open or interface resolution failed).
+    pub(crate) fn capture(iface: &str, source: io::Error) -> Self {
+        Self(ErrorKind::Capture {
+            iface: iface.to_owned(),
+            source,
+        })
+    }
+
+    /// The reflector named `name` could not be built.
+    pub(crate) fn reflector(name: &str, source: BuildError) -> Self {
+        Self(ErrorKind::Reflector {
+            name: name.to_owned(),
+            source,
+        })
+    }
 }
 
 impl fmt::Display for Error {

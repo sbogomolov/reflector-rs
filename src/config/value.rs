@@ -128,8 +128,6 @@ pub(crate) struct InterfaceName(String);
 
 impl InterfaceName {
     /// The interface name as a string slice.
-    // Used by tests; the capture layer reads it to bind sockets to the interface.
-    #[allow(dead_code)]
     #[must_use]
     pub(crate) fn as_str(&self) -> &str {
         &self.0
@@ -172,8 +170,6 @@ pub(crate) struct ReflectorName(String);
 
 impl ReflectorName {
     /// The name as a string slice.
-    // Used by tests; kept as the name's read accessor for the reflector layer.
-    #[allow(dead_code)]
     #[must_use]
     pub(crate) fn as_str(&self) -> &str {
         &self.0
