@@ -77,6 +77,22 @@ impl AddressFamily {
     pub(crate) fn uses_ipv6(self) -> bool {
         matches!(self, Self::Default | Self::Dual | Self::Ipv6)
     }
+
+    /// Whether a v4 source must be present at startup, else the reflector fails to build. The
+    /// same set as [`uses_ipv4`](Self::uses_ipv4) — v4 is the baseline — but a distinct concept
+    /// (the C++ `RequiresIPv4`): `Default` requires v4 even while treating v6 as best-effort.
+    #[must_use]
+    pub(crate) fn requires_ipv4(self) -> bool {
+        matches!(self, Self::Default | Self::Dual | Self::Ipv4)
+    }
+
+    /// Whether a v6 source must be present at startup, else the reflector fails to build — only
+    /// `Dual` and `Ipv6`. Unlike [`uses_ipv6`](Self::uses_ipv6), `Default` does not require v6:
+    /// it reflects v6 when available but starts without it (the C++ `RequiresIPv6`).
+    #[must_use]
+    pub(crate) fn requires_ipv6(self) -> bool {
+        matches!(self, Self::Dual | Self::Ipv6)
+    }
 }
 
 /// Error returned when a string is not a valid [`AddressFamily`].
@@ -264,6 +280,36 @@ impl<'de> Deserialize<'de> for WolPorts {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn address_family_uses_and_requires() {
+        use AddressFamily as F;
+        // Uses: which families the reflector handles. Default and Dual handle both.
+        assert_eq!(
+            (F::Default.uses_ipv4(), F::Default.uses_ipv6()),
+            (true, true)
+        );
+        assert_eq!((F::Dual.uses_ipv4(), F::Dual.uses_ipv6()), (true, true));
+        assert_eq!((F::Ipv4.uses_ipv4(), F::Ipv4.uses_ipv6()), (true, false));
+        assert_eq!((F::Ipv6.uses_ipv4(), F::Ipv6.uses_ipv6()), (false, true));
+        // Requires: which must be present at startup. Default requires v4 only (v6 best-effort).
+        assert_eq!(
+            (F::Default.requires_ipv4(), F::Default.requires_ipv6()),
+            (true, false)
+        );
+        assert_eq!(
+            (F::Dual.requires_ipv4(), F::Dual.requires_ipv6()),
+            (true, true)
+        );
+        assert_eq!(
+            (F::Ipv4.requires_ipv4(), F::Ipv4.requires_ipv6()),
+            (true, false)
+        );
+        assert_eq!(
+            (F::Ipv6.requires_ipv4(), F::Ipv6.requires_ipv6()),
+            (false, true)
+        );
+    }
 
     #[test]
     fn log_level_parses_via_fromstr() {

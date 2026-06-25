@@ -4,10 +4,18 @@
 //! A magic packet is 6 bytes of `0xFF` followed by the target device's MAC repeated 16 times
 //! (102 bytes); a trailing `SecureOn` password, if present, is forwarded verbatim. The reflector
 //! validates the payload, then re-emits it on the target interface as a v4 limited broadcast /
-//! v6 link-local all-nodes multicast, sourced from that interface's own address (the handler
-//! and `build`, which wire this into the dispatcher, land with the next steps).
+//! v6 link-local all-nodes multicast, sourced from that interface's own address.
 
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+
+use crate::config::{AddressFamily, Reflector};
+use crate::dispatch::{CaptureKey, Filter, PacketDispatcher, PacketHandler};
+use crate::interface::InterfaceAddresses;
 use crate::net::mac::MacAddr;
+use crate::net::packet::Packet;
+use crate::reactor::Reactor;
+
+use super::{BuildError, InterfaceMap, IpFamily};
 
 /// The all-ones prefix that opens a magic packet.
 const PREFIX_LEN: usize = 6;
@@ -17,6 +25,15 @@ const MAC_LEN: usize = 6;
 const MAC_REPS: usize = 16;
 /// The smallest valid magic packet: the prefix plus the 16 MAC repetitions.
 const MAGIC_LEN: usize = PREFIX_LEN + MAC_REPS * MAC_LEN;
+
+/// The IPv6 link-local all-nodes multicast group (`ff02::1`): every node on the link, the v6
+/// equivalent of the IPv4 limited broadcast a magic packet re-emits to.
+const V6_ALL_NODES: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1);
+
+/// The per-handler reusable frame buffer. A magic packet (102 B, plus an optional `SecureOn`
+/// tail) with L2/IP/UDP headers fits comfortably; `send_udp_group` reports an overflow rather
+/// than truncating.
+const SCRATCH_LEN: usize = 2048;
 
 /// Whether `payload` opens with a Wake-on-LAN magic packet for an acceptable target: the
 /// `6×0xFF` prefix followed by one MAC repeated 16 times. Trailing bytes (a `SecureOn` password)
@@ -40,6 +57,155 @@ fn is_magic_packet(payload: &[u8], target_mac: Option<MacAddr>) -> bool {
     }
     // A configured target narrows the reflector to that device's wake.
     target_mac.is_none_or(|target| mac == target.octets())
+}
+
+/// A built Wake-on-LAN reflector: re-emits each validated magic packet on its `egress` interface.
+/// One is registered per configured port. Holds a reused scratch buffer so the data path never
+/// allocates.
+struct WolReflector {
+    egress: CaptureKey,
+    /// Optional device filter; `None` relays a wake for any device.
+    target_mac: Option<MacAddr>,
+    /// IP-version policy: which families this reflector re-emits.
+    family: AddressFamily,
+    scratch: Box<[u8]>,
+}
+
+impl PacketHandler for WolReflector {
+    fn on_packet(
+        &mut self,
+        packet: &Packet,
+        dispatcher: &mut PacketDispatcher,
+        _reactor: &mut Reactor,
+    ) {
+        if !is_magic_packet(packet.payload, self.target_mac) {
+            log::debug!("WoL: ignoring non-magic packet from {}", packet.source);
+            return;
+        }
+        let Some(dst) = wol_destination(self.family, packet) else {
+            log::debug!(
+                "WoL: {} is not a handled address family; ignoring",
+                packet.source
+            );
+            return;
+        };
+        // A family the egress can't currently source is a quiet drop (a transient address loss);
+        // that keeps send_udp_group's error meaning a genuine build/send failure.
+        if !egress_sources(dispatcher, self.egress, dst) {
+            log::debug!(
+                "WoL: egress has no source for {dst} yet; dropping wake from {}",
+                packet.source
+            );
+            return;
+        }
+        match dispatcher.send_udp_group(
+            self.egress,
+            dst,
+            packet.source.port(),
+            packet.ttl,
+            packet.payload,
+            &mut self.scratch,
+        ) {
+            Ok(()) => log::info!("reflected WoL packet from {} to {dst}", packet.source),
+            Err(e) => log::warn!(
+                "WoL: cannot reflect packet from {} to {dst}: {e}",
+                packet.source
+            ),
+        }
+    }
+}
+
+/// The link-wide destination a magic packet captured as `packet` re-emits to under `family`: the
+/// IPv4 limited broadcast or the IPv6 link-local all-nodes group, at the captured destination
+/// port. `None` when `family` doesn't handle the packet's IP version, so the reflector ignores it.
+fn wol_destination(family: AddressFamily, packet: &Packet) -> Option<SocketAddr> {
+    match packet.dest {
+        SocketAddr::V4(dest) if family.uses_ipv4() => {
+            Some(SocketAddr::from((Ipv4Addr::BROADCAST, dest.port())))
+        }
+        SocketAddr::V6(dest) if family.uses_ipv6() => {
+            Some(SocketAddr::from((V6_ALL_NODES, dest.port())))
+        }
+        _ => None,
+    }
+}
+
+/// Whether the egress currently has a source address of `dst`'s family — what `send_udp_group`
+/// needs to build the frame.
+fn egress_sources(dispatcher: &PacketDispatcher, egress: CaptureKey, dst: SocketAddr) -> bool {
+    dispatcher
+        .egress_addrs(egress)
+        .is_some_and(|addrs| match dst {
+            SocketAddr::V4(_) => addrs.v4.is_some(),
+            SocketAddr::V6(_) => addrs.v6.is_some(),
+        })
+}
+
+/// The family `addrs` cannot source but `family` requires, if any — the startup check's verdict.
+/// `None` means every required family is available (a v6-best-effort `Default` with no v6 passes).
+fn missing_required_family(family: AddressFamily, addrs: &InterfaceAddresses) -> Option<IpFamily> {
+    if family.requires_ipv4() && addrs.v4.is_none() {
+        Some(IpFamily::V4)
+    } else if family.requires_ipv6() && addrs.v6.is_none() {
+        Some(IpFamily::V6)
+    } else {
+        None
+    }
+}
+
+/// Build the Wake-on-LAN reflector(s) for `reflector` and register them on `dispatcher` — a no-op
+/// when Wake-on-LAN isn't enabled for it. Registers one handler per configured port (the dispatcher
+/// filters a single port each), all re-emitting on the target interface.
+///
+/// # Errors
+/// [`BuildError::UnknownInterface`] if no capture was opened for the source/target, or
+/// [`BuildError::RequiredFamilyUnavailable`] if the target can't currently send a required family.
+pub(crate) fn build(
+    reflector: &Reflector,
+    interfaces: &InterfaceMap,
+    dispatcher: &mut PacketDispatcher,
+) -> Result<(), BuildError> {
+    let Some(wol) = &reflector.wol else {
+        return Ok(());
+    };
+    let ingress = interfaces
+        .key_for(reflector.source_if.as_str())
+        .ok_or_else(|| BuildError::UnknownInterface(reflector.source_if.as_str().to_owned()))?;
+    let egress = interfaces
+        .key_for(reflector.target_if.as_str())
+        .ok_or_else(|| BuildError::UnknownInterface(reflector.target_if.as_str().to_owned()))?;
+
+    let addrs = dispatcher.egress_addrs(egress).copied().unwrap_or_default();
+    if let Some(family) = missing_required_family(reflector.address_family, &addrs) {
+        return Err(BuildError::RequiredFamilyUnavailable {
+            interface: reflector.target_if.as_str().to_owned(),
+            family,
+        });
+    }
+
+    for port in wol.ports.iter() {
+        dispatcher.register(
+            ingress,
+            Filter {
+                dst_port: Some(port.get()),
+                ..Filter::default()
+            },
+            Box::new(WolReflector {
+                egress,
+                target_mac: reflector.mac,
+                family: reflector.address_family,
+                scratch: vec![0u8; SCRATCH_LEN].into_boxed_slice(),
+            }),
+        );
+    }
+    log::info!(
+        "WoL reflector \"{}\": {} -> {} on {} port(s)",
+        reflector.name.as_str(),
+        reflector.source_if.as_str(),
+        reflector.target_if.as_str(),
+        wol.ports.len()
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -97,5 +263,63 @@ mod tests {
         // Corrupt the 7th repetition so it no longer matches the first.
         packet[PREFIX_LEN + 6 * MAC_LEN] ^= 0xff;
         assert!(!is_magic_packet(&packet, None));
+    }
+
+    /// A packet whose `dest` (the captured Wake-on-LAN port) drives the re-emit destination.
+    fn packet_to(dest: &str) -> Packet<'static> {
+        Packet {
+            source: "10.0.0.1:5".parse().unwrap(),
+            dest: dest.parse().unwrap(),
+            ttl: 64,
+            dst_mac: None,
+            src_mac: None,
+            payload: b"",
+        }
+    }
+
+    #[test]
+    fn wol_destination_targets_the_link_for_used_families() {
+        let v4 = packet_to("10.0.0.2:9");
+        let v6 = packet_to("[fe80::2]:9");
+        // Dual handles both: v4 -> limited broadcast, v6 -> ff02::1, at the captured dst port.
+        assert_eq!(
+            wol_destination(AddressFamily::Dual, &v4),
+            Some("255.255.255.255:9".parse().unwrap())
+        );
+        assert_eq!(
+            wol_destination(AddressFamily::Dual, &v6),
+            Some("[ff02::1]:9".parse().unwrap())
+        );
+        // A single-family policy ignores the other family.
+        assert_eq!(wol_destination(AddressFamily::Ipv4, &v6), None);
+        assert_eq!(wol_destination(AddressFamily::Ipv6, &v4), None);
+    }
+
+    #[test]
+    fn missing_required_family_enforces_the_requires_policy() {
+        let none = InterfaceAddresses::default();
+        let v4_only = InterfaceAddresses {
+            v4: Some(Ipv4Addr::LOCALHOST),
+            ..Default::default()
+        };
+        // Default requires v4 only: a v4-less egress fails on v4, a v6-less one passes.
+        assert_eq!(
+            missing_required_family(AddressFamily::Default, &none),
+            Some(IpFamily::V4)
+        );
+        assert_eq!(
+            missing_required_family(AddressFamily::Default, &v4_only),
+            None
+        );
+        // Dual requires both: a v4-only egress still misses v6.
+        assert_eq!(
+            missing_required_family(AddressFamily::Dual, &v4_only),
+            Some(IpFamily::V6)
+        );
+        // Ipv6 requires v6.
+        assert_eq!(
+            missing_required_family(AddressFamily::Ipv6, &v4_only),
+            Some(IpFamily::V6)
+        );
     }
 }
