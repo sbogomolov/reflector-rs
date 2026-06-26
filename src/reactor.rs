@@ -84,6 +84,12 @@ pub(crate) trait Handler {
     /// `now` is the run loop's single read of the clock, passed in so the sweep is testable without
     /// a real clock. Like the readiness callbacks, the handler gets `&mut Reactor`.
     fn on_deadline(&mut self, _now: Instant, _reactor: &mut Reactor) {}
+
+    /// Called once, right after [`register`](Reactor::register) inserts this handler, handing it its
+    /// own [`HandlerKey`]. A handler that later watches fds it opens — or unregisters itself — records
+    /// the key here. Defaulted to a no-op: most handlers act only through the `event` they are handed
+    /// and never need it.
+    fn adopt_key(&mut self, _key: HandlerKey) {}
 }
 
 /// What a registration is ready for in a given dispatch — the event a poll loop
@@ -157,11 +163,17 @@ impl Reactor {
 
     /// Register `handler`, returning its key. It watches no fds yet — attach them with
     /// [`watch`](Self::watch), or use [`register_with_fds`](Self::register_with_fds) for
-    /// a handler whose fds are known up front.
-    pub(crate) fn register(&mut self, handler: Box<dyn Handler>) -> HandlerKey {
-        HandlerKey(self.handlers.insert(HandlerEntry {
-            handler: Some(handler),
-            regs: Vec::new(),
+    /// a handler whose fds are known up front. The handler's [`adopt_key`](Handler::adopt_key) is
+    /// called with the new key before this returns.
+    pub(crate) fn register(&mut self, mut handler: Box<dyn Handler>) -> HandlerKey {
+        HandlerKey(self.handlers.insert_from(|key| {
+            // Hand the handler its own key before it is stored, so one that later watches fds it opens
+            // (or self-unregisters) has it recorded.
+            handler.adopt_key(HandlerKey(key));
+            HandlerEntry {
+                handler: Some(handler),
+                regs: Vec::new(),
+            }
         }))
     }
 
@@ -843,6 +855,26 @@ mod tests {
         assert_eq!(event.user_data, 0xdead_beef); // the token round-trips
         assert_eq!(event.fd, raw);
         assert_eq!(event.reg_key, rk);
+    }
+
+    #[test]
+    fn register_hands_the_handler_its_own_key() {
+        // A handler that records the key it is adopted with, so we can check it matches `register`'s.
+        struct KeyRecorder(Rc<Cell<Option<HandlerKey>>>);
+        impl Handler for KeyRecorder {
+            fn on_readable(&mut self, _event: ReadyEvent, _reactor: &mut Reactor) {}
+            fn adopt_key(&mut self, key: HandlerKey) {
+                self.0.set(Some(key));
+            }
+        }
+        let mut reactor = Reactor::new().unwrap();
+        let seen = Rc::new(Cell::new(None));
+        let key = reactor.register(Box::new(KeyRecorder(seen.clone())));
+        assert_eq!(
+            seen.get(),
+            Some(key),
+            "adopt_key received the handler's own key"
+        );
     }
 
     /// A handler with no fd that only carries a timer: it reports `deadline` and runs `on_fire`

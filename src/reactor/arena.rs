@@ -70,23 +70,36 @@ impl<T> Arena<T> {
     /// Panics if more than `u32::MAX` slots have ever been allocated (the index
     /// space is exhausted) — unreachable for the reactor's handful of descriptors.
     pub(crate) fn insert(&mut self, value: T) -> Key {
+        self.insert_from(|_| value)
+    }
+
+    /// Store a value built from the key that will address it — for a value that must know its own key
+    /// (such as a reactor handler that later watches fds under, or unregisters, its own key). The arena
+    /// resolves the key first and hands it to `make`, whose result occupies the slot; the caller never
+    /// supplies a key.
+    ///
+    /// # Panics
+    /// As [`insert`](Self::insert): if the `u32` index space is exhausted.
+    pub(crate) fn insert_from<F>(&mut self, make: F) -> Key
+    where
+        F: FnOnce(Key) -> T,
+    {
         if let Some(index) = self.free.pop() {
-            let slot = &mut self.slots[index as usize];
-            slot.value = Some(value);
-            Key {
-                index,
-                generation: slot.generation,
-            }
+            let generation = self.slots[index as usize].generation;
+            let key = Key { index, generation };
+            self.slots[index as usize].value = Some(make(key));
+            key
         } else {
             let index = u32::try_from(self.slots.len()).expect("arena index space exhausted");
-            self.slots.push(Slot {
-                generation: 0,
-                value: Some(value),
-            });
-            Key {
+            let key = Key {
                 index,
                 generation: 0,
-            }
+            };
+            self.slots.push(Slot {
+                generation: 0,
+                value: Some(make(key)),
+            });
+            key
         }
     }
 
@@ -172,6 +185,38 @@ mod tests {
         let key = arena.insert(1);
         *arena.get_mut(key).unwrap() += 41;
         assert_eq!(arena.get(key), Some(&42));
+    }
+
+    #[test]
+    fn insert_from_passes_the_assigned_key() {
+        let mut arena = Arena::new();
+        let mut captured = None;
+        let key = arena.insert_from(|k| {
+            captured = Some(k);
+            "v"
+        });
+        assert_eq!(
+            captured,
+            Some(key),
+            "the closure saw the key it inserts under"
+        );
+        assert_eq!(arena.get(key), Some(&"v"));
+    }
+
+    #[test]
+    fn insert_from_reflects_a_reused_slot_generation() {
+        let mut arena = Arena::new();
+        let first = arena.insert("first");
+        arena.remove(first);
+        let mut captured = None;
+        let second = arena.insert_from(|k| {
+            captured = Some(k);
+            "second"
+        });
+        // The key `make` receives is the final one, with the reused slot's bumped generation.
+        assert_eq!(captured, Some(second));
+        assert_eq!(first.index, second.index);
+        assert_ne!(first.generation, second.generation);
     }
 
     #[test]
