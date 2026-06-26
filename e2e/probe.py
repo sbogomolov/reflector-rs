@@ -6,9 +6,11 @@
 # magic packet (broadcast for IPv4, all-nodes multicast for IPv6) toward the reflector. The receiver's
 # process exit code is the verdict run.py waits on: 0 = expectation held, non-zero = failed.
 #
-# This file is WoL-only. The mDNS/SSDP/DIAL probe verbs (respond/search/dial-device/dial-client) from
-# the C++ harness are intentionally absent; the send/receive core and the magic-packet + multicast-join
-# helpers below are exactly what re-adding those protocols would build on.
+# The send/receive verbs cover WoL and the verbatim-relay protocols (mDNS, one-way SSDP). The
+# respond/search verbs drive the SSDP M-SEARCH round trip: a `respond` device unicasts a 200 OK back to
+# whoever searched, and a `search` searcher awaits that reply proxied across segments by the reflector.
+# The DIAL probe verbs (dial-device/dial-client) from the C++ harness are intentionally absent: DIAL is
+# unimplemented in this project.
 
 from __future__ import annotations
 
@@ -153,6 +155,85 @@ def receive(args: argparse.Namespace) -> int:
     return 1
 
 
+def respond(args: argparse.Namespace) -> int:
+    # The SSDP round-trip "device": wait for one (relayed) M-SEARCH on the group, then unicast a 200 OK
+    # straight back to its sender. The sender is the reflector's reserved port on the target segment,
+    # which proxies the reply back to the searcher on the source segment.
+    family = socket.AF_INET6 if args.family == 6 else socket.AF_INET
+    bind_address = "::" if family == socket.AF_INET6 else "0.0.0.0"
+
+    with socket.socket(family, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((bind_address, args.port))
+        if args.join_group is not None:
+            join_group(sock, family, args.join_group, args.interface)
+        # Readiness marker so run.py can sequence the searcher after the responder is listening.
+        print(f"responder ready: UDP socket bound on port {args.port}", flush=True)
+
+        sock.settimeout(args.timeout)
+        try:
+            payload, peer = sock.recvfrom(4096)
+        except TimeoutError:
+            print(f"responder: no datagram for {args.timeout:.3f}s", file=sys.stderr, flush=True)
+            return 1
+
+        print(f"responder received {len(payload)} bytes from {peer[0]}:{peer[1]}", flush=True)
+        # Reply straight back to the sender (the reflector's target_if:P); it proxies to the searcher.
+        # peer is the full tuple recvfrom returned (4-tuple for IPv6), preserving the link-local scope.
+        sock.sendto(args.reply_hex, peer)
+        print(f"responder replied {len(args.reply_hex)} bytes to {peer[0]}:{peer[1]}", flush=True)
+        return 0
+
+
+def search(args: argparse.Namespace) -> int:
+    # The SSDP round-trip "searcher": send an M-SEARCH to the group from a known source port, then await
+    # the proxied unicast 200 OK the reflector relays back from the device on the target segment.
+    family = socket.AF_INET6 if args.family == 6 else socket.AF_INET
+    bind_address = "::" if family == socket.AF_INET6 else "0.0.0.0"
+
+    with socket.socket(family, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((bind_address, args.source_port))  # the searcher's known source port
+
+        scope_id = 0
+        if family == socket.AF_INET6:
+            if args.interface:
+                scope_id = socket.if_nametoindex(args.interface)
+                sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_MULTICAST_IF, scope_id)
+            sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_MULTICAST_HOPS, 1)
+            dest = (args.address, args.port, 0, scope_id)
+        else:
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 1)
+            if args.interface:
+                ifindex = socket.if_nametoindex(args.interface)
+                mreqn = struct.pack("@4s4si", b"\x00\x00\x00\x00", b"\x00\x00\x00\x00", ifindex)
+                sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, mreqn)
+            dest = (args.address, args.port)
+
+        print(f"searcher ready: bound source port {args.source_port}", flush=True)
+        sock.sendto(args.payload_hex, dest)
+        print(f"searcher sent {len(args.payload_hex)} bytes to {args.address}:{args.port}", flush=True)
+
+        sock.settimeout(args.timeout)
+        try:
+            payload, peer = sock.recvfrom(4096)
+        except TimeoutError:
+            if args.expect_none:
+                print(f"searcher: no reply for {args.timeout:.3f}s (as expected)", flush=True)
+                return 0
+            print(f"searcher: no reply for {args.timeout:.3f}s", file=sys.stderr, flush=True)
+            return 1
+
+        print(f"searcher received {len(payload)} bytes from {peer[0]}:{peer[1]}: {packet_hex(payload)}", flush=True)
+        if args.expect_none:
+            print("searcher: expected no reply, but one was received", file=sys.stderr, flush=True)
+            return 1
+        if payload == args.expect_payload_hex:
+            return 0
+        print("searcher: reply payload does not match expected 200 OK", file=sys.stderr, flush=True)
+        return 1
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="UDP probe used by reflector Docker e2e tests")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -178,6 +259,28 @@ def main() -> int:
     expectation.add_argument("--expect-payload-hex", type=parse_payload_hex, help="exact UDP payload that must be received")
     expectation.add_argument("--expect-none", action="store_true", help="fail if any UDP packet is received")
     receive_parser.set_defaults(func=receive)
+
+    respond_parser = subparsers.add_parser("respond", help="receive one datagram, then unicast a reply to its sender")
+    respond_parser.add_argument("--port", required=True, type=int, help="UDP port to bind")
+    respond_parser.add_argument("--timeout", required=True, type=float, help="seconds to wait for the datagram")
+    respond_parser.add_argument("--family", default=4, type=int, choices=(4, 6), help="IP version to bind")
+    respond_parser.add_argument("--join-group", help="multicast group to join on --interface")
+    respond_parser.add_argument("--interface", help="interface to join the multicast group on")
+    respond_parser.add_argument("--reply-hex", required=True, type=parse_payload_hex, help="UDP payload to unicast back")
+    respond_parser.set_defaults(func=respond)
+
+    search_parser = subparsers.add_parser("search", help="send an M-SEARCH from a bound port, then await the proxied reply")
+    search_parser.add_argument("--source-port", required=True, type=int, help="UDP port to bind and send from")
+    search_parser.add_argument("--port", required=True, type=int, help="destination UDP port (1900)")
+    search_parser.add_argument("--address", required=True, help="multicast group to send to")
+    search_parser.add_argument("--interface", help="egress interface for multicast")
+    search_parser.add_argument("--family", default=4, type=int, choices=(4, 6), help="IP version")
+    search_parser.add_argument("--payload-hex", required=True, type=parse_payload_hex, help="M-SEARCH payload")
+    search_parser.add_argument("--timeout", required=True, type=float, help="seconds to await the reply")
+    search_expectation = search_parser.add_mutually_exclusive_group(required=True)
+    search_expectation.add_argument("--expect-payload-hex", type=parse_payload_hex, help="expected 200 OK payload")
+    search_expectation.add_argument("--expect-none", action="store_true", help="fail if any reply is received")
+    search_parser.set_defaults(func=search)
 
     args = parser.parse_args()
     return args.func(args)

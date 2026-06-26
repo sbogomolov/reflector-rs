@@ -17,7 +17,8 @@ target_if = "wol_dst"
 wol = true
 wol_ports = [40011]
 
-[reflectors.mdns]
+[reflectors.discovery]
 source_if = "wol_src"
 target_if = "wol_dst"
 mdns = true
+ssdp = true

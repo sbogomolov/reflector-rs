@@ -50,6 +50,44 @@ MDNS_QUERY_HEX = "00000000000100000000000074657374"
 MDNS_RESPONSE_HEX = "00008400000100010000000074657374"
 # 8 bytes: below the 12-byte DNS-header minimum, so classify() returns None and drops it.
 MDNS_SHORT_QUERY_HEX = "0000000000010000"
+# --- SSDP (UPnP discovery, HTTPU): multicast group 239.255.255.250 / ff02::c on UDP 1900. ---
+SSDP_GROUP_V4 = "239.255.255.250"
+SSDP_GROUP_V6 = "ff02::c"
+SSDP_PORT = 1900
+# A non-SSDP UDP port: the dispatcher filter pins dst_port=1900, so a datagram to the group on this
+# port is captured but never dispatched to the reflector.
+SSDP_WRONG_PORT = 1901
+# SSDP discovery messages (HTTPU). The reflector classifies on the leading method token only and relays
+# the bytes verbatim, so the receiver expects exactly what was sent; the HOST line is immaterial here.
+SSDP_MSEARCH_HEX = (
+    "M-SEARCH * HTTP/1.1\r\n"
+    "HOST: 239.255.255.250:1900\r\n"
+    'MAN: "ssdp:discover"\r\n'
+    "MX: 2\r\n"
+    "ST: ssdp:all\r\n\r\n"
+).encode().hex()
+SSDP_NOTIFY_HEX = (
+    "NOTIFY * HTTP/1.1\r\n"
+    "HOST: 239.255.255.250:1900\r\n"
+    "NT: upnp:rootdevice\r\n"
+    "NTS: ssdp:alive\r\n\r\n"
+).encode().hex()
+# A search response that strayed onto the group: neither M-SEARCH nor NOTIFY, so the reflector
+# classifies it as non-SSDP and drops it.
+SSDP_HTTP_RESPONSE_HEX = (
+    "HTTP/1.1 200 OK\r\n"
+    "ST: ssdp:all\r\n\r\n"
+).encode().hex()
+# The unicast 200 OK a device sends back to an M-SEARCH; the round-trip responder replies with this and
+# the searcher asserts it arrives verbatim after the reflector proxies it across segments.
+SSDP_OK_HEX = (
+    "HTTP/1.1 200 OK\r\n"
+    "CACHE-CONTROL: max-age=1800\r\n"
+    "ST: ssdp:all\r\n"
+    "USN: uuid:device::ssdp:all\r\n"
+    "LOCATION: http://device.invalid/desc.xml\r\n\r\n"
+).encode().hex()
+SEARCHER_SOURCE_PORT = 49152
 # --- Address-change cases: knock out one (interface, family) source on the reflector, prove
 # reflection of that family stops, then restore it and prove it resumes. The reflector reacts on
 # its own event loop after the netlink notification, so each check polls across that async window.
@@ -252,6 +290,126 @@ MDNS_CASES = [
     ),
 ]
 
+# SSDP one-way reflection is directional: M-SEARCH searches relay source->target ("forward"), NOTIFY
+# advertisements relay target->source ("reverse"). Both are relayed verbatim, so the receiver asserts
+# the exact bytes it sent. The drop cases assert nothing arrives (the wrong direction, a non-SSDP
+# payload, or a port the dispatcher filter never passes). The M-SEARCH round trip -- search out, 200 OK
+# proxied back -- is a RoundTripCase below, not a one-way TestCase.
+SSDP_CASES = [
+    TestCase(
+        name="reflects_ssdp_msearch",
+        send_port=SSDP_PORT,
+        receive_port=SSDP_PORT,
+        expect_mac=None,
+        timeout_seconds=5.0,
+        send_payload_hex=SSDP_MSEARCH_HEX,
+        expect_payload_hex=SSDP_MSEARCH_HEX,
+        group=SSDP_GROUP_V4,
+        direction="forward",
+    ),
+    TestCase(
+        name="reflects_ssdp_msearch_ipv6",
+        send_port=SSDP_PORT,
+        receive_port=SSDP_PORT,
+        expect_mac=None,
+        timeout_seconds=5.0,
+        send_payload_hex=SSDP_MSEARCH_HEX,
+        expect_payload_hex=SSDP_MSEARCH_HEX,
+        group=SSDP_GROUP_V6,
+        family=6,
+        direction="forward",
+    ),
+    TestCase(
+        name="reflects_ssdp_notify",
+        send_port=SSDP_PORT,
+        receive_port=SSDP_PORT,
+        expect_mac=None,
+        timeout_seconds=5.0,
+        send_payload_hex=SSDP_NOTIFY_HEX,
+        expect_payload_hex=SSDP_NOTIFY_HEX,
+        group=SSDP_GROUP_V4,
+        direction="reverse",
+    ),
+    TestCase(
+        name="reflects_ssdp_notify_ipv6",
+        send_port=SSDP_PORT,
+        receive_port=SSDP_PORT,
+        expect_mac=None,
+        timeout_seconds=5.0,
+        send_payload_hex=SSDP_NOTIFY_HEX,
+        expect_payload_hex=SSDP_NOTIFY_HEX,
+        group=SSDP_GROUP_V6,
+        family=6,
+        direction="reverse",
+    ),
+    # An M-SEARCH sent target->source hits the target's NOTIFY-only handler and is dropped.
+    TestCase(
+        name="ignores_ssdp_msearch_in_notify_direction",
+        send_port=SSDP_PORT,
+        receive_port=SSDP_PORT,
+        expect_mac=None,
+        timeout_seconds=1.5,
+        send_payload_hex=SSDP_MSEARCH_HEX,
+        group=SSDP_GROUP_V4,
+        direction="reverse",
+    ),
+    # A NOTIFY sent source->target hits the source's M-SEARCH-only handler and is dropped.
+    TestCase(
+        name="ignores_ssdp_notify_in_msearch_direction",
+        send_port=SSDP_PORT,
+        receive_port=SSDP_PORT,
+        expect_mac=None,
+        timeout_seconds=1.5,
+        send_payload_hex=SSDP_NOTIFY_HEX,
+        group=SSDP_GROUP_V4,
+        direction="forward",
+    ),
+    # Neither M-SEARCH nor NOTIFY: classified as non-SSDP and dropped.
+    TestCase(
+        name="ignores_ssdp_http_response_on_group",
+        send_port=SSDP_PORT,
+        receive_port=SSDP_PORT,
+        expect_mac=None,
+        timeout_seconds=1.5,
+        send_payload_hex=SSDP_HTTP_RESPONSE_HEX,
+        group=SSDP_GROUP_V4,
+        direction="forward",
+    ),
+    # The dispatcher filter pins dst_port=1900. Listen on the SEND port, not 1900: the reflector
+    # re-emits to the captured dest port verbatim, so a regression that dispatched this 1901 datagram
+    # would re-emit it to the group on 1901 -- invisible to a 1900-bound receiver. Binding the send
+    # port keeps the "not reflected" assertion able to observe a misforward.
+    TestCase(
+        name="ignores_ssdp_wrong_port",
+        send_port=SSDP_WRONG_PORT,
+        receive_port=SSDP_WRONG_PORT,
+        expect_mac=None,
+        timeout_seconds=1.5,
+        send_payload_hex=SSDP_MSEARCH_HEX,
+        group=SSDP_GROUP_V4,
+        direction="forward",
+    ),
+]
+
+
+@dataclasses.dataclass(frozen=True)
+class RoundTripCase:
+    name: str
+    family: int  # 4 or 6
+    group: str
+    timeout_seconds: float = 8.0
+    # When False, no responder is started and the searcher must receive nothing -- the reflector must
+    # not fabricate or loop back a reply to an M-SEARCH no device answered.
+    expect_reply: bool = True
+
+
+ROUNDTRIP_CASES = [
+    RoundTripCase(name="ssdp_msearch_roundtrip", family=4, group=SSDP_GROUP_V4),
+    RoundTripCase(name="ssdp_msearch_roundtrip_ipv6", family=6, group=SSDP_GROUP_V6),
+    RoundTripCase(name="ssdp_msearch_no_responder_no_reply", family=4, group=SSDP_GROUP_V4,
+        timeout_seconds=2.0, expect_reply=False),
+]
+
 # Per-protocol probe parameters for the address-change phases: wol sends a magic packet (no payload
 # or group); mdns sends a query to its family's group, relayed verbatim.
 PROBE_SPECS = {
@@ -298,7 +456,8 @@ ADDRESS_CHANGE_CASES = [
     ),
 ]
 
-ALL_CASES: list[TestCase | AddressChangeCase] = [*TEST_CASES, *MDNS_CASES, *ADDRESS_CHANGE_CASES]
+ALL_CASES: list[TestCase | RoundTripCase | AddressChangeCase] = [
+    *TEST_CASES, *MDNS_CASES, *SSDP_CASES, *ROUNDTRIP_CASES, *ADDRESS_CHANGE_CASES]
 
 
 def format_command(command: list[str]) -> str:
@@ -576,6 +735,78 @@ class DockerE2E:
             self.print_reflector_logs()
 
 
+class DockerRoundTrip(DockerE2E):
+    # The SSDP M-SEARCH round trip: a searcher on the source segment sends an M-SEARCH; the reflector
+    # relays it to the group on the target from a reserved port; a responder (device) on the target
+    # unicasts a 200 OK back to that reserved port; the reflector proxies the reply to the searcher. The
+    # negative case (expect_reply=False) starts no responder and asserts the searcher hears nothing -- the
+    # reflector must not fabricate a reply.
+    def __init__(self, args: argparse.Namespace, case: RoundTripCase) -> None:
+        # The base __init__ only reads case.name and case.direction; a TestCase shim reuses all its
+        # network/reflector setup + cleanup with no duplication.
+        shim = TestCase(name=case.name, send_port=SSDP_PORT, receive_port=SSDP_PORT,
+            expect_mac=None, timeout_seconds=case.timeout_seconds, family=case.family,
+            group=case.group, direction="forward")
+        super().__init__(args, shim)
+        self.rt = case
+        self.responder_container = f"{self.prefix}-responder"
+        self.searcher_container = f"{self.prefix}-searcher"
+        self.containers = [self.searcher_container, self.responder_container, self.reflector_container]
+
+    def start_responder(self) -> None:
+        docker([
+            "run", "-d", "--name", self.responder_container,
+            "--network", f"name={self.target_network},driver-opt=com.docker.network.endpoint.ifname={RECEIVER_IFNAME}",
+            "--mount", f"type=bind,source={E2E_DIR},target=/e2e,readonly",
+            self.args.helper_image, "python3", "/e2e/probe.py", "respond",
+            "--port", str(SSDP_PORT), "--timeout", str(self.rt.timeout_seconds),
+            "--family", str(self.rt.family), "--join-group", self.rt.group,
+            "--interface", RECEIVER_IFNAME, "--reply-hex", SSDP_OK_HEX,
+        ])
+        self.wait_for_container_log(self.responder_container, "responder ready", "responder")
+
+    def run_searcher(self) -> None:
+        expectation = ["--expect-payload-hex", SSDP_OK_HEX] if self.rt.expect_reply else ["--expect-none"]
+        docker([
+            "run", "-d", "--name", self.searcher_container,
+            "--network", f"name={self.source_network},driver-opt=com.docker.network.endpoint.ifname={REFLECTOR_SOURCE_IFNAME}",
+            "--mount", f"type=bind,source={E2E_DIR},target=/e2e,readonly",
+            self.args.helper_image, "python3", "/e2e/probe.py", "search",
+            "--source-port", str(SEARCHER_SOURCE_PORT), "--port", str(SSDP_PORT),
+            "--address", self.rt.group, "--interface", REFLECTOR_SOURCE_IFNAME,
+            "--family", str(self.rt.family), "--payload-hex", SSDP_MSEARCH_HEX,
+            "--timeout", str(self.rt.timeout_seconds), *expectation,
+        ])
+
+    def wait_for_searcher(self) -> None:
+        exit_code = docker(["wait", self.searcher_container]).stdout.strip()
+        logs = docker(["logs", self.searcher_container], check=False)
+        if logs.stdout:
+            print(logs.stdout, end="", flush=True)
+        if logs.stderr:
+            print(logs.stderr, end="", file=sys.stderr, flush=True)
+        if exit_code != "0":
+            raise RuntimeError(f"searcher failed with exit code {exit_code}")
+
+    def run(self) -> None:
+        print(f"\n=== {self.rt.name} ===", flush=True)
+        self.setup_networks()
+        self.start_reflector()
+        if self.rt.expect_reply:
+            self.start_responder()  # must be listening before the search goes out
+        self.run_searcher()
+        self.wait_for_searcher()
+        # The per-searcher session must be torn down once it expires (MX 2 + 2s grace ~= 4s): the
+        # deadline timer sweeps it, drops its port reservation, and unregisters its response capture --
+        # logged by the reflector. wait_for_container_log raises if the eviction never fires.
+        self.wait_for_container_log(self.reflector_container, "evicted SSDP session", "session eviction")
+        print(f"{self.rt.name}: session evicted after expiry", flush=True)
+        print(f"PASS {self.rt.name}", flush=True)
+        if self.args.show_reflector_logs:
+            time.sleep(0.5)
+            self.print_reflector_logs()
+
+
 class DockerAddressChange(DockerE2E):
     # Proves the dynamic family bring-up/teardown end to end: with a dual-family reflector running,
     # knock out one (interface, family) source address at a time and verify -- with real traffic, not
@@ -751,7 +982,10 @@ class DockerAddressChange(DockerE2E):
             self.print_reflector_logs()
 
 
-def make_runner(args: argparse.Namespace, case: TestCase | AddressChangeCase) -> DockerE2E:
+def make_runner(args: argparse.Namespace,
+        case: TestCase | RoundTripCase | AddressChangeCase) -> DockerE2E:
+    if isinstance(case, RoundTripCase):
+        return DockerRoundTrip(args, case)
     if isinstance(case, AddressChangeCase):
         return DockerAddressChange(args, case)
     return DockerE2E(args, case)
@@ -761,7 +995,7 @@ def build_reflector_image(image: str) -> None:
     docker(["build", "-t", image, "."], capture=False)
 
 
-def select_cases(case_names: list[str]) -> list[TestCase | AddressChangeCase]:
+def select_cases(case_names: list[str]) -> list[TestCase | RoundTripCase | AddressChangeCase]:
     if not case_names:
         return ALL_CASES
 
