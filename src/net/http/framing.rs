@@ -1,5 +1,6 @@
-//! The per-direction streaming HTTP/1.1 framer: header scan + authority rewrite (this step), then the
-//! zero-copy body framing + `feed` loop (the next step). Built on the parent module's authority parser.
+//! The per-direction streaming HTTP/1.1 framer: it buffers and rewrites the header, then forwards the
+//! body as a zero-copy slice of the fed input via [`feed`](HttpFraming::feed). Built on the parent
+//! module's authority parser.
 
 use std::net::SocketAddrV4;
 
@@ -7,6 +8,17 @@ use super::{Authority, parse_authority, strip_prefix_ignore_ascii_case};
 
 /// CRLF, the HTTP line terminator.
 const CRLF: &[u8] = b"\r\n";
+
+/// The blank line that ends a header block.
+const HEADER_TERMINATOR: &[u8] = b"\r\n\r\n";
+
+/// The header-block byte cap: a header that has not terminated by this point is refused, so a peer
+/// can't grow the owner's buffer unbounded. The proxy's receive buffer must EXCEED this (a const-assert
+/// there) or the over-cap refusal can't fire before the buffer fills and the reader livelocks.
+pub(crate) const MAX_HEADER: usize = 2 * 1024;
+
+/// The same unterminated-line guard for a single chunk-size or trailer line.
+const MAX_CHUNK_LINE: usize = 256;
 
 /// Which side of the splice a framer parses: the start line differs (request-line vs status-line),
 /// and only a response can be close-delimited.
@@ -23,14 +35,32 @@ enum Phase {
     Header,
     BodyContentLength,
     BodyChunked,
+    /// After the zero-size chunk: consume trailer field lines until the blank line.
+    BodyChunkedTrailers,
     BodyCloseDelimited,
 }
 
-/// A malformed message — the proxy maps any variant to drop-and-close.
+/// A malformed or over-cap message — the proxy maps any variant to drop-and-close.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum FramingError {
+    /// A header block that never terminated within [`MAX_HEADER`] bytes.
+    HeaderTooLong,
     /// A `Content-Length` value that isn't a bare non-negative integer.
     MalformedContentLength,
+    /// A chunk-size line that isn't a hex integer.
+    MalformedChunkSize,
+    /// A chunk-size or trailer line that never terminated within [`MAX_CHUNK_LINE`] bytes.
+    ChunkLineTooLong,
+}
+
+/// One [`feed`](HttpFraming::feed) call's forwardable output: the rewritten `header` (a view into the
+/// framer's scratch; empty while a body streams across feeds), the `body` (a zero-copy slice of the fed
+/// input; possibly empty), and `consumed` — how many fed bytes to drop. `consumed == 0` means an
+/// incomplete header: read more and feed again.
+pub(crate) struct Framed<'a> {
+    pub(crate) header: &'a [u8],
+    pub(crate) body: &'a [u8],
+    pub(crate) consumed: usize,
 }
 
 /// Per-direction incremental HTTP/1.1 framing with an authority-header rewrite. It buffers only the
@@ -160,6 +190,123 @@ impl HttpFraming {
             }
         };
     }
+
+    /// Feed a contiguous view of the owner's buffered bytes; returns the forwardable [`Framed`]. Each
+    /// call yields at most one message's header plus as much of its body as arrived; the owner forwards
+    /// `header` then `body`, drops `consumed` bytes, and feeds again until `consumed` is 0 (an
+    /// incomplete header — read more). `header` borrows the framer's scratch and `body` the input, so
+    /// the owner forwards both before advancing past `consumed`.
+    ///
+    /// # Errors
+    /// A malformed or over-cap message: see [`FramingError`].
+    pub(crate) fn feed<'a>(&'a mut self, input: &'a [u8]) -> Result<Framed<'a>, FramingError> {
+        let mut pos = 0;
+        let mut header_complete = false;
+        if matches!(self.phase, Phase::Header) {
+            let Some(end) = find_header_end(input) else {
+                if input.len() > MAX_HEADER {
+                    return Err(FramingError::HeaderTooLong);
+                }
+                return Ok(Framed {
+                    header: &[],
+                    body: &[],
+                    consumed: 0,
+                }); // incomplete: read more
+            };
+            self.scan_and_rewrite_header(&input[..end])?;
+            pos = end;
+            header_complete = true;
+        }
+        // Forward as much of the body as arrived (a zero-copy slice of `input`), stopping at the message
+        // boundary, the end of the input, or an incomplete chunk/trailer line (left for the next feed).
+        let body_start = pos;
+        loop {
+            if pos >= input.len() {
+                break;
+            }
+            match self.phase {
+                Phase::Header => break, // the next message starts here — one message per feed
+                Phase::BodyContentLength => {
+                    let take = self.body_remaining.min(input.len() - pos);
+                    pos += take;
+                    self.body_remaining -= take;
+                    if self.body_remaining == 0 {
+                        self.phase = Phase::Header;
+                    }
+                    break; // a Content-Length body is one contiguous run
+                }
+                Phase::BodyCloseDelimited => {
+                    pos = input.len(); // forward all; the message ends at EOF (the owner's signal)
+                    break;
+                }
+                Phase::BodyChunked if self.chunk_remaining > 0 => {
+                    // Forwarding the current chunk's DATA(+CRLF), opaquely.
+                    let take = self.chunk_remaining.min(input.len() - pos);
+                    pos += take;
+                    self.chunk_remaining -= take;
+                    if self.chunk_remaining > 0 {
+                        break; // ran out mid-chunk
+                    }
+                }
+                Phase::BodyChunked => {
+                    // At a chunk boundary: parse the next chunk-size line.
+                    let Some(rel) = find_crlf(&input[pos..]) else {
+                        if input.len() - pos > MAX_CHUNK_LINE {
+                            return Err(FramingError::ChunkLineTooLong);
+                        }
+                        break; // incomplete chunk-size line
+                    };
+                    let size = parse_chunk_size(&input[pos..pos + rel])?;
+                    pos += rel + CRLF.len();
+                    if size == 0 {
+                        self.phase = Phase::BodyChunkedTrailers;
+                    } else {
+                        self.chunk_remaining = size + CRLF.len(); // chunk DATA + its terminating CRLF
+                    }
+                }
+                Phase::BodyChunkedTrailers => {
+                    // Consume trailer field lines opaquely until the blank line ends the body.
+                    let Some(rel) = find_crlf(&input[pos..]) else {
+                        if input.len() - pos > MAX_CHUNK_LINE {
+                            return Err(FramingError::ChunkLineTooLong);
+                        }
+                        break; // incomplete trailer line
+                    };
+                    let blank = rel == 0;
+                    pos += rel + CRLF.len();
+                    if blank {
+                        self.phase = Phase::Header;
+                    }
+                }
+            }
+        }
+        // Take the scratch borrow only now, after the loop is done mutating `self`.
+        Ok(Framed {
+            header: if header_complete { &self.header } else { &[] },
+            body: &input[body_start..pos],
+            consumed: pos,
+        })
+    }
+}
+
+/// The length of the header block in `input` (up to and including the terminating blank line), or
+/// `None` if the blank line has not arrived yet.
+fn find_header_end(input: &[u8]) -> Option<usize> {
+    input
+        .windows(HEADER_TERMINATOR.len())
+        .position(|w| w == HEADER_TERMINATOR)
+        .map(|i| i + HEADER_TERMINATOR.len())
+}
+
+/// Parse a chunk-size line's hex length, dropping any `;`-delimited chunk extensions.
+fn parse_chunk_size(line: &[u8]) -> Result<usize, FramingError> {
+    let hex = match line.iter().position(|&b| b == b';') {
+        Some(semi) => &line[..semi],
+        None => line,
+    };
+    let text =
+        std::str::from_utf8(hex.trim_ascii()).map_err(|_| FramingError::MalformedChunkSize)?;
+    usize::from_str_radix(text, 16).map_err(|_| FramingError::MalformedChunkSize)
 }
 
 /// The byte offset of the first CRLF in `s`, or `None`.
@@ -315,5 +462,132 @@ mod tests {
         f.scan_and_rewrite_header(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n")
             .unwrap();
         assert_eq!(f.phase, Phase::BodyChunked);
+    }
+
+    /// Drive `f` over `input` like the proxy: feed, record `(header, body)`, consume, until an
+    /// incomplete header. Returns the framed messages as owned byte pairs.
+    fn drain(f: &mut HttpFraming, input: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut buf = input.to_vec();
+        let mut out = Vec::new();
+        loop {
+            let framed = f.feed(&buf).unwrap();
+            if framed.consumed == 0 {
+                break;
+            }
+            let pair = (framed.header.to_vec(), framed.body.to_vec());
+            let consumed = framed.consumed;
+            out.push(pair);
+            buf.drain(..consumed);
+        }
+        out
+    }
+
+    #[test]
+    fn frames_a_content_length_message() {
+        let mut f = framing(Kind::Response, |_| None);
+        let msgs = drain(&mut f, b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].0, b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n");
+        assert_eq!(msgs[0].1, b"hello");
+    }
+
+    #[test]
+    fn frames_a_chunked_message_forwarding_the_body_opaquely() {
+        let mut f = framing(Kind::Response, |_| None);
+        let msgs = drain(
+            &mut f,
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n3\r\nbar\r\n0\r\n\r\n",
+        );
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(
+            msgs[0].0,
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+        );
+        // The chunk framing rides out in the body untouched.
+        assert_eq!(msgs[0].1, b"5\r\nhello\r\n3\r\nbar\r\n0\r\n\r\n");
+    }
+
+    #[test]
+    fn frames_multiple_keep_alive_messages() {
+        let mut f = framing(Kind::Response, |_| None);
+        // A Content-Length response immediately followed by a chunked one on the same connection.
+        let msgs = drain(
+            &mut f,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi\
+              HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nbye\r\n0\r\n\r\n",
+        );
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].1, b"hi");
+        assert_eq!(msgs[1].1, b"3\r\nbye\r\n0\r\n\r\n");
+    }
+
+    #[test]
+    fn forwards_chunked_trailers_opaquely() {
+        let mut f = framing(Kind::Response, |_| None);
+        let msgs = drain(
+            &mut f,
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nX-Trailer: v\r\n\r\n",
+        );
+        assert_eq!(msgs.len(), 1);
+        // The trailer field and the closing blank line ride out in the body.
+        assert_eq!(msgs[0].1, b"0\r\nX-Trailer: v\r\n\r\n");
+    }
+
+    #[test]
+    fn close_delimited_streams_the_body_across_feeds() {
+        let mut f = framing(Kind::Response, |_| None);
+        let input = b"HTTP/1.1 200 OK\r\nServer: x\r\n\r\nabc";
+        let first = f.feed(input).unwrap();
+        assert_eq!(first.header, b"HTTP/1.1 200 OK\r\nServer: x\r\n\r\n");
+        assert_eq!(first.body, b"abc");
+        assert_eq!(first.consumed, input.len()); // header + all arrived body
+        // The phase stays close-delimited, so a later feed forwards more with no header.
+        let second = f.feed(b"def").unwrap();
+        assert_eq!(second.header, b"");
+        assert_eq!(second.body, b"def");
+    }
+
+    #[test]
+    fn streams_a_content_length_body_across_feeds() {
+        let mut f = framing(Kind::Response, |_| None);
+        // First feed: header + 3 of the 5 declared body bytes.
+        let first = f
+            .feed(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nabc")
+            .unwrap();
+        assert_eq!(
+            first.header,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n"
+        );
+        assert_eq!(first.body, b"abc");
+        // Second feed (after the owner consumed the first): the remaining 2 bytes, no header.
+        let second = f.feed(b"de").unwrap();
+        assert_eq!(second.header, b"");
+        assert_eq!(second.body, b"de");
+        assert_eq!(second.consumed, 2);
+    }
+
+    #[test]
+    fn an_incomplete_header_consumes_nothing() {
+        let mut f = framing(Kind::Request, |_| None);
+        let framed = f.feed(b"GET / HTTP/1.1\r\nHost: x").unwrap(); // no blank line yet
+        assert_eq!(framed.consumed, 0);
+        assert_eq!(framed.header, b"");
+        assert_eq!(framed.body, b"");
+    }
+
+    #[test]
+    fn an_unterminated_oversize_header_errors() {
+        let mut f = framing(Kind::Request, |_| None);
+        let huge = vec![b'x'; MAX_HEADER + 1]; // no blank line, over the cap
+        assert!(matches!(f.feed(&huge), Err(FramingError::HeaderTooLong)));
+    }
+
+    #[test]
+    fn a_malformed_chunk_size_errors() {
+        let mut f = framing(Kind::Response, |_| None);
+        assert!(matches!(
+            f.feed(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nZZ\r\n"),
+            Err(FramingError::MalformedChunkSize)
+        ));
     }
 }
