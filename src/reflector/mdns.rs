@@ -1,4 +1,4 @@
-//! The mDNS reflector: relays multicast DNS between the source and target interfaces so service
+//! The mDNS reflector: reflects multicast DNS between the source and target interfaces so service
 //! discovery crosses the link. For each address family it registers two directional handlers —
 //! queries flow source → target, responses target → source — which, atop the capture's own-egress
 //! drop, breaks the reflection loop. Each re-emits to the same group at TTL 255 (RFC 6762 §11),
@@ -16,7 +16,7 @@ use crate::reactor::Reactor;
 
 use super::{BuildError, InterfaceMap, IpFamily, egress_sources, missing_required_family};
 
-/// A built mDNS relay for one direction of one family: re-emits each message of its `kind` (query
+/// A built mDNS reflector for one direction of one family: re-emits each message of its `kind` (query
 /// or response) captured on its ingress onto `egress`, to the message's own destination. The
 /// dispatcher's filter pins that to the group, so the handler only classifies and re-emits.
 struct MdnsReflector {
@@ -65,7 +65,7 @@ impl PacketHandler for MdnsReflector {
                     ),
                 }
             }
-            // The other direction's traffic. Dropping it is the loop-breaker: a relayed query
+            // The other direction's traffic. Dropping it is the loop-breaker: a reflected query
             // re-emitted on the target is still a query, so the target's response-only handler
             // ignores it (and vice versa).
             Some(_) => {}
@@ -127,7 +127,7 @@ pub(crate) fn build(
                 log::debug!("mDNS: join {group_ip} deferred: {e}");
             }
         }
-        // source → target: relay queries (any client on source may ask).
+        // source → target: reflect queries (any client on source may ask).
         dispatcher.register(
             source,
             Filter {
@@ -140,7 +140,7 @@ pub(crate) fn build(
                 kind: MdnsKind::Query,
             }),
         );
-        // target → source: relay responses, optionally only from the configured device's MAC.
+        // target → source: reflect responses, optionally only from the configured device's MAC.
         dispatcher.register(
             target,
             Filter {

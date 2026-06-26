@@ -15,7 +15,7 @@ pub(crate) const MDNS_GROUP_V6: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 
 
 /// An mDNS message is a query or a response, per the QR bit of its DNS header. Unsolicited
 /// announcements are responses too (RFC 6762 §8.3), so this split is exactly the reflector's
-/// directional gate: queries relay source → target, responses target → source.
+/// directional gate: queries reflect source → target, responses target → source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MdnsKind {
     Query,

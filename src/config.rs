@@ -37,7 +37,7 @@ use crate::net::mac::MacAddr;
 /// Wake-on-LAN settings (present only when `WoL` is enabled for the reflector).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Wol {
-    /// UDP destination ports whose magic packets are relayed.
+    /// UDP destination ports whose magic packets are reflected.
     pub(crate) ports: WolPorts,
 }
 

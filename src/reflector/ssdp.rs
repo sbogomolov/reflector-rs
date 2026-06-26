@@ -1,5 +1,5 @@
-//! The SSDP reflector: relays Simple Service Discovery Protocol (`UPnP`) between the source and
-//! target interfaces so service discovery crosses the link. This stage relays advertisements
+//! The SSDP reflector: reflects Simple Service Discovery Protocol (`UPnP`) between the source and
+//! target interfaces so service discovery crosses the link. This stage reflects advertisements
 //! (`NOTIFY`, target → source) only; the M-SEARCH search/unicast-response path lands in a later
 //! step. Each re-emit goes to the same group at TTL 2, sourced from the egress interface. The
 //! dispatcher's filter pins the group, so a handler only classifies the message and re-emits.
@@ -18,10 +18,10 @@ use crate::reactor::Reactor;
 
 use super::{BuildError, InterfaceMap, IpFamily, egress_sources, missing_required_family};
 
-/// Relays SSDP advertisements (`NOTIFY`) captured on the target onto `egress` (the source), to the
+/// Reflects SSDP advertisements (`NOTIFY`) captured on the target onto `egress` (the source), to the
 /// message's own destination — the dispatcher's filter pins that to the group. Searches (`M-SEARCH`)
-/// flow the other way through a separate session relay (a later step), so this handler only ever
-/// relays advertisements.
+/// flow the other way through a separate search reflector (a later step), so this handler only ever
+/// reflects advertisements.
 struct SsdpAdvertisementReflector {
     egress: CaptureKey,
 }
@@ -59,8 +59,8 @@ impl PacketHandler for SsdpAdvertisementReflector {
                     ),
                 }
             }
-            // A search (M-SEARCH) on this direction isn't relayed: searches flow source → target
-            // through a session relay (a later step).
+            // A search (M-SEARCH) on this direction isn't reflected: searches flow source → target
+            // through the search reflector (a later step).
             Some(SsdpKind::Search) => {}
             // A non-SSDP payload on the group is anomalous but harmless; drop it quietly.
             None => log::debug!(
@@ -73,7 +73,7 @@ impl PacketHandler for SsdpAdvertisementReflector {
     }
 }
 
-/// Build the SSDP reflector for `reflector` and register its advertisement relay on `dispatcher` —
+/// Build the SSDP reflector for `reflector` and register its advertisement reflector on `dispatcher` —
 /// a no-op when SSDP isn't enabled. For each address family in use it joins every group on the
 /// target (where advertisements are captured) and registers one handler: advertisements
 /// target → source. A required family must be sendable on BOTH interfaces, since the full reflector
@@ -92,7 +92,7 @@ pub(crate) fn build(
     };
     if ssdp.dial {
         log::warn!(
-            "SSDP reflector \"{}\": DIAL is not yet implemented; relaying without LOCATION rewrite",
+            "SSDP reflector \"{}\": DIAL is not yet implemented; reflecting without LOCATION rewrite",
             reflector.name.as_str()
         );
     }
@@ -133,7 +133,7 @@ pub(crate) fn build(
         if let Err(e) = dispatcher.join_group(target, group_ip) {
             log::debug!("SSDP: join {group_ip} deferred: {e}");
         }
-        // target -> source: relay advertisements, optionally only from the configured device's MAC.
+        // target -> source: reflect advertisements, optionally only from the configured device's MAC.
         dispatcher.register(
             target,
             Filter {

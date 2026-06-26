@@ -1,5 +1,5 @@
 //! An ephemeral-UDP-port reservation: a held, never-read socket whose only job is to keep the
-//! kernel's UDP demux satisfied. The SSDP search relay re-emits an M-SEARCH from this port so
+//! kernel's UDP demux satisfied. The SSDP search reflector re-emits an M-SEARCH from this port so
 //! devices unicast their `200 OK` back to it; the port must stay claimed for the session's lifetime
 //! so the kernel finds a socket for the reply and does NOT answer it with an ICMP port-unreachable.
 //! The bound socket is never read — the raw capture reads the actual datagram; on Linux a drop-all
@@ -20,7 +20,7 @@ pub(crate) struct PortReservation {
 }
 
 impl PortReservation {
-    /// Reserve an ephemeral port on `addr` (the egress interface's own address — the relay sends
+    /// Reserve an ephemeral port on `addr` (the egress interface's own address — the reflector sends
     /// from it and devices reply to it): open a `SOCK_DGRAM` socket, bind it to `addr:0`, and read
     /// the assigned port back. `ifindex` is the interface index, required to bind an IPv6 link-local
     /// `addr` (ignored for IPv4). On Linux a drop-all filter makes the socket enqueue nothing — the

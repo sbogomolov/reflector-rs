@@ -15,8 +15,8 @@ pub(crate) const SSDP_GROUP_V6_LINK_LOCAL: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0
 pub(crate) const SSDP_GROUP_V6_SITE_LOCAL: Ipv6Addr = Ipv6Addr::new(0xff05, 0, 0, 0, 0, 0, 0, 0x0c);
 
 /// An SSDP message is a search or an advertisement, per its HTTPU request line. This split is the
-/// reflector's directional gate: searches (`M-SEARCH`) relay source → target, advertisements
-/// (`NOTIFY` — both `ssdp:alive` and `ssdp:byebye`) relay target → source.
+/// reflector's directional gate: searches (`M-SEARCH`) reflect source → target, advertisements
+/// (`NOTIFY` — both `ssdp:alive` and `ssdp:byebye`) reflect target → source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SsdpKind {
     Search,
@@ -56,7 +56,7 @@ mod tests {
 
     #[test]
     fn rejects_non_search_non_notify() {
-        // A unicast search response travels off the multicast path; on the group it isn't relayed.
+        // A unicast search response travels off the multicast path; on the group it isn't reflected.
         assert_eq!(classify(b"HTTP/1.1 200 OK\r\n"), None);
         assert_eq!(classify(b""), None);
         assert_eq!(classify(b"GARBAGE"), None);

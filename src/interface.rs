@@ -125,7 +125,7 @@ impl Interface {
     }
 }
 
-/// Rank an IPv6 source candidate: link-local > ULA > global > other. The reflector relays
+/// Rank an IPv6 source candidate: link-local > ULA > global > other. The reflector reflects
 /// link-local service traffic, so a link-local source is preferred; a global address is
 /// the fallback when no link-local is usable.
 fn v6_rank(addr: Ipv6Addr) -> u8 {

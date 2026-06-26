@@ -83,7 +83,7 @@ pub(crate) struct InterfaceKey(u32);
 
 /// A `Copy` handle to a routing registration — the generational arena [`Key`] of its slot, newtyped
 /// so it can't be confused with a reactor key or a [`CaptureKey`]. Returned by
-/// [`register`](PacketDispatcher::register); the SSDP search relay will hold it to
+/// [`register`](PacketDispatcher::register); the SSDP search reflector will hold it to
 /// [`unregister`](PacketDispatcher::unregister) a per-searcher capture when its session ends.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct RegistrationKey(Key);
@@ -410,7 +410,7 @@ impl PacketDispatcher {
 
     /// Register `handler`, gated by `filter`, for packets captured on `ingress`. The returned
     /// [`Key`] removes it again via [`unregister`](Self::unregister) — for the per-searcher response
-    /// captures the SSDP search relay creates dynamically; a static reflector ignores it.
+    /// captures the SSDP search reflector creates dynamically; a static reflector ignores it.
     pub(crate) fn register(
         &mut self,
         ingress: CaptureKey,
@@ -426,7 +426,7 @@ impl PacketDispatcher {
 
     /// Remove the registration `key` addresses, freeing its slot; a stale key is a safe no-op.
     /// Tears down a per-searcher response capture when its session expires.
-    // The SSDP search relay (a later step) is the only caller; until it lands this is unused.
+    // The SSDP search reflector (a later step) is the only caller; until it lands this is unused.
     #[allow(dead_code)]
     pub(crate) fn unregister(&mut self, key: RegistrationKey) {
         self.registrations.remove(key.0);

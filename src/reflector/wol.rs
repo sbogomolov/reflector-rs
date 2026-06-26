@@ -33,7 +33,7 @@ const V6_ALL_NODES: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1);
 /// `6×0xFF` prefix followed by one MAC repeated 16 times. Trailing bytes (a `SecureOn` password)
 /// are ignored — only the leading [`MAGIC_LEN`] are inspected — and the caller forwards them
 /// as-is. When `target_mac` is set, the repeated MAC must equal it, so only that one device's
-/// wakes are relayed.
+/// wakes are reflected.
 fn is_magic_packet(payload: &[u8], target_mac: Option<MacAddr>) -> bool {
     let Some(magic) = payload.get(..MAGIC_LEN) else {
         return false;
@@ -57,7 +57,7 @@ fn is_magic_packet(payload: &[u8], target_mac: Option<MacAddr>) -> bool {
 /// One is registered per configured port.
 struct WolReflector {
     egress: CaptureKey,
-    /// Optional device filter; `None` relays a wake for any device.
+    /// Optional device filter; `None` reflects a wake for any device.
     target_mac: Option<MacAddr>,
     /// IP-version policy: which families this reflector re-emits.
     family: AddressFamily,
