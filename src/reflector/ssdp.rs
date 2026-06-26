@@ -9,6 +9,7 @@ use std::net::SocketAddr;
 use crate::config::{AddressFamily, Reflector};
 use crate::dispatch::{CaptureKey, Filter, PacketDispatcher, PacketHandler};
 use crate::interface::InterfaceAddresses;
+use crate::net::mac::MacAddr;
 use crate::net::packet::Packet;
 use crate::net::ssdp::{
     SSDP_GROUP_V4, SSDP_GROUP_V6_LINK_LOCAL, SSDP_GROUP_V6_SITE_LOCAL, SSDP_PORT, SSDP_TTL,
@@ -68,6 +69,53 @@ impl PacketHandler for SsdpAdvertisementReflector {
                 packet.payload.len(),
                 packet.dest,
                 packet.source
+            ),
+        }
+    }
+}
+
+/// One M-SEARCH session's reply path: a standalone leaf that re-emits each unicast `200 OK` — captured
+/// at the session's reserved port on the target — onto `egress` (the source), back to the single
+/// `searcher` that searched. It carries everything a reply needs, so no session lookup is required:
+/// the reply goes to the searcher's captured frame MAC (no ARP/ND) and is sourced from the responding
+/// device's own reply port (preserved from the captured packet). The search reflector (a later step)
+/// creates one per session and drops it when the session expires.
+#[allow(dead_code)] // registered by the SSDP search reflector (a later step)
+struct SsdpResponseReflector {
+    searcher: SocketAddr,
+    searcher_mac: MacAddr,
+    egress: CaptureKey,
+}
+
+impl PacketHandler for SsdpResponseReflector {
+    fn on_packet(
+        &mut self,
+        packet: &Packet,
+        dispatcher: &mut PacketDispatcher,
+        _reactor: &mut Reactor,
+    ) {
+        // The dispatcher's filter already pinned this capture to the reserved port, so every packet
+        // here is a unicast reply for this searcher — nothing to classify. A family the source can't
+        // currently send is a quiet drop (transient address loss), as in the advertisement direction.
+        if !egress_sources(dispatcher, self.egress, self.searcher) {
+            return;
+        }
+        match dispatcher.send_udp(
+            self.egress,
+            self.searcher,
+            self.searcher_mac,
+            packet.source.port(),
+            SSDP_TTL,
+            packet.payload,
+        ) {
+            Ok(()) => log::debug!(
+                "reflected SSDP response from {} to searcher {}",
+                packet.source,
+                self.searcher
+            ),
+            Err(e) => log::warn!(
+                "SSDP: cannot reflect response to searcher {}: {e}",
+                self.searcher
             ),
         }
     }
