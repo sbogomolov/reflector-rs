@@ -434,21 +434,22 @@ impl PacketDispatcher {
         self.table.capture(egress).map(Capture::link_type)
     }
 
-    /// Build a broadcast/multicast UDP datagram — sourced from the egress's own address —
-    /// and inject it on `egress`. The link framing (Ethernet vs `DLT_NULL`) follows the
-    /// egress's link type and the L2 destination MAC follows `dst`'s address class; the
-    /// source port, `ttl`, and `payload` are carried verbatim into the new datagram. Builds
-    /// into the dispatcher's reused [`scratch`](SCRATCH_LEN) buffer, so the data path never
+    /// Build a UDP datagram — sourced from the egress's own address — with `dst_mac` as the L2
+    /// destination, and inject it on `egress`. The caller supplies the L2 MAC, so this serves
+    /// unicast, multicast, and broadcast alike; the link framing (Ethernet vs `DLT_NULL`) follows
+    /// the egress's link type, and the source port, `ttl`, and `payload` are carried verbatim.
+    /// Builds into the dispatcher's reused [`scratch`](SCRATCH_LEN) buffer, so the data path never
     /// allocates. An unknown or draining egress is a logged drop, like [`send`](Self::send).
     ///
     /// # Errors
     /// Propagates a send failure, and reports a frame that can't be built from the egress's
     /// current state — no source address/MAC for the datagram, or a payload that overflows
     /// the scratch buffer or the datagram length fields.
-    pub(crate) fn send_udp_group(
+    pub(crate) fn send_udp(
         &mut self,
         egress: CaptureKey,
         dst: SocketAddr,
+        dst_mac: MacAddr,
         src_port: u16,
         ttl: u8,
         payload: &[u8],
@@ -461,9 +462,38 @@ impl PacketDispatcher {
             log::warn!("egress {egress:?} unavailable (drained or unknown); datagram dropped");
             return Ok(());
         };
-        let n = build_udp_group(&addrs, link, dst, src_port, ttl, payload, &mut self.scratch)
-            .map_err(io::Error::other)?;
+        let n = build_udp(
+            &addrs,
+            link,
+            dst,
+            dst_mac,
+            src_port,
+            ttl,
+            payload,
+            &mut self.scratch,
+        )
+        .map_err(io::Error::other)?;
         self.send(egress, &self.scratch[..n])
+    }
+
+    /// Inject a broadcast/multicast UDP datagram on `egress`, deriving the L2 destination MAC from
+    /// `dst`'s address class (all-ones for the IPv4 limited broadcast, the RFC-derived group MAC
+    /// for multicast) — a thin wrapper over [`send_udp`](Self::send_udp). A unicast `dst` has no
+    /// derivable group MAC, so it is a [`BuildError::UnicastDestination`]; use `send_udp` with an
+    /// explicit MAC for unicast.
+    ///
+    /// # Errors
+    /// As [`send_udp`](Self::send_udp), plus [`BuildError::UnicastDestination`] for a unicast `dst`.
+    pub(crate) fn send_udp_group(
+        &mut self,
+        egress: CaptureKey,
+        dst: SocketAddr,
+        src_port: u16,
+        ttl: u8,
+        payload: &[u8],
+    ) -> io::Result<()> {
+        let dst_mac = ethernet_dst(dst.ip()).map_err(io::Error::other)?;
+        self.send_udp(egress, dst, dst_mac, src_port, ttl, payload)
     }
 
     /// Drain the capture `ingress` addresses and route each parsed packet. Reads up to
@@ -587,9 +617,10 @@ impl PacketDispatcher {
     }
 }
 
-/// Why [`build_udp_group`] could not assemble a frame from an egress's current state. Each is a
-/// case the reflector's family/MAC gating makes unreachable in practice, but they stay
-/// typed so the builder is unit-testable and a stray one logs precisely.
+/// Why a datagram could not be assembled for an egress: from [`build_udp`] (no source address or
+/// MAC, or a frame overflow) or [`ethernet_dst`] (a unicast destination). Each is a case the
+/// reflector's family/MAC gating makes unreachable in practice, but they stay typed so the
+/// builder is unit-testable and a stray one logs precisely.
 #[derive(Debug, Error, PartialEq, Eq)]
 enum BuildError {
     /// The egress has no source address for the datagram's family.
@@ -618,15 +649,19 @@ fn ethernet_dst(dst: IpAddr) -> Result<MacAddr, BuildError> {
     }
 }
 
-/// Assemble a broadcast/multicast UDP datagram for an egress with addresses `addrs` and link
-/// framing `link` into `scratch`, returning its byte length. The L2 source is the egress's
-/// own IP and MAC; the L2 destination MAC follows `dst`'s address class. BSD `DLT_NULL`
-/// (loopback/tunnel) carries no L2 addresses, so it needs neither a source MAC nor a derived
-/// destination MAC.
-fn build_udp_group(
+/// Assemble a UDP datagram for an egress with addresses `addrs` and link framing `link` into
+/// `scratch`, returning its byte length. The L2 source is the egress's own IP and MAC; the L2
+/// destination is the caller-supplied `dst_mac` (so this serves unicast, multicast, and broadcast
+/// alike). BSD `DLT_NULL` (loopback/tunnel) carries no L2 addresses, so it ignores `dst_mac` and
+/// needs no source MAC.
+// A frame builder takes the full wire spec (egress addrs + link, dst addr + MAC, port, ttl,
+// payload, buffer); bundling any of these would obscure more than the arg count costs.
+#[allow(clippy::too_many_arguments)]
+fn build_udp(
     addrs: &InterfaceAddresses,
     link: LinkType,
     dst: SocketAddr,
+    dst_mac: MacAddr,
     src_port: u16,
     ttl: u8,
     payload: &[u8],
@@ -637,7 +672,7 @@ fn build_udp_group(
             let src = SocketAddrV4::new(addrs.v4.ok_or(BuildError::NoSourceAddress)?, src_port);
             match link {
                 LinkType::Ethernet => Ok(frame::ethernet_ipv4_udp(
-                    ethernet_dst(IpAddr::V4(*dst.ip()))?,
+                    dst_mac,
                     addrs.mac.ok_or(BuildError::NoSourceMac)?,
                     src,
                     dst,
@@ -654,7 +689,7 @@ fn build_udp_group(
                 SocketAddrV6::new(addrs.v6.ok_or(BuildError::NoSourceAddress)?, src_port, 0, 0);
             match link {
                 LinkType::Ethernet => Ok(frame::ethernet_ipv6_udp(
-                    ethernet_dst(IpAddr::V6(*dst.ip()))?,
+                    dst_mac,
                     addrs.mac.ok_or(BuildError::NoSourceMac)?,
                     src,
                     dst,
@@ -804,7 +839,7 @@ mod tests {
         assert!(!v6.matches(&packet("10.0.0.1:5353", "224.0.0.251:5353", None, None)));
     }
 
-    // --- send_udp_group frame assembly (build_udp_group / ethernet_dst) — privilege-free ---
+    // --- send_udp frame assembly (build_udp / ethernet_dst) — privilege-free ---
 
     /// A fully-populated egress: a MAC and both families, for the builder tests.
     fn full_addrs() -> InterfaceAddresses {
@@ -838,48 +873,76 @@ mod tests {
     }
 
     #[test]
-    fn build_udp_group_v4_broadcast_sources_from_the_egress() {
+    fn build_udp_v4_broadcast_sources_from_the_egress() {
         let addrs = full_addrs();
         let dst = SocketAddr::from((Ipv4Addr::BROADCAST, 9));
         let mut scratch = [0u8; 2048];
-        let n = build_udp_group(
+        let n = build_udp(
             &addrs,
             LinkType::Ethernet,
             dst,
+            MacAddr::broadcast(),
             4000,
             64,
             b"wol",
             &mut scratch,
         )
         .unwrap();
-        // L2 header: all-ones destination, the egress's own MAC as source.
+        // L2 header: the supplied destination MAC, the egress's own MAC as source.
         assert_eq!(&scratch[0..6], MacAddr::broadcast().octets().as_slice());
         assert_eq!(&scratch[6..12], addrs.mac.unwrap().octets().as_slice());
         assert!(n > 12, "frame must extend past the L2 header");
     }
 
     #[test]
-    fn build_udp_group_v6_derives_the_multicast_mac() {
+    fn build_udp_v6_writes_the_supplied_mac() {
         let addrs = full_addrs();
-        let dst = SocketAddr::from((Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1), 9));
+        let group = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1);
+        let dst = SocketAddr::from((group, 9));
         let mut scratch = [0u8; 2048];
-        build_udp_group(
+        build_udp(
             &addrs,
             LinkType::Ethernet,
             dst,
+            MacAddr::multicast_for(IpAddr::V6(group)),
             4000,
             64,
             b"wol",
             &mut scratch,
         )
         .unwrap();
-        // 33:33 + the low 32 bits of ff02::1, then the egress's own MAC as source (as v4).
+        // 33:33 + the low 32 bits of ff02::1 (the supplied MAC), then the egress's own MAC.
         assert_eq!(&scratch[0..6], [0x33, 0x33, 0, 0, 0, 0x01].as_slice());
         assert_eq!(&scratch[6..12], addrs.mac.unwrap().octets().as_slice());
     }
 
     #[test]
-    fn build_udp_group_needs_a_source_address_for_the_family() {
+    fn build_udp_assembles_a_unicast_frame() {
+        // The unicast path the M-SEARCH 200-OK reply will use: an explicit dst MAC, a unicast dst
+        // (build_udp doesn't derive the MAC, so unicast is fine — unlike send_udp_group).
+        let addrs = full_addrs();
+        let searcher_mac = MacAddr::from([0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f]);
+        let dst = SocketAddr::from((Ipv4Addr::new(192, 168, 0, 5), 9));
+        let mut scratch = [0u8; 2048];
+        let n = build_udp(
+            &addrs,
+            LinkType::Ethernet,
+            dst,
+            searcher_mac,
+            4000,
+            64,
+            b"ok",
+            &mut scratch,
+        )
+        .unwrap();
+        // The supplied unicast MAC is the L2 destination; the egress's own MAC is the source.
+        assert_eq!(&scratch[0..6], searcher_mac.octets().as_slice());
+        assert_eq!(&scratch[6..12], addrs.mac.unwrap().octets().as_slice());
+        assert!(n > 12);
+    }
+
+    #[test]
+    fn build_udp_needs_a_source_address_for_the_family() {
         // A v6-less egress cannot source a v6 datagram.
         let v4_only = InterfaceAddresses {
             v6: None,
@@ -888,10 +951,11 @@ mod tests {
         let dst = SocketAddr::from((Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1), 9));
         let mut scratch = [0u8; 2048];
         assert_eq!(
-            build_udp_group(
+            build_udp(
                 &v4_only,
                 LinkType::Ethernet,
                 dst,
+                MacAddr::broadcast(),
                 4000,
                 64,
                 b"x",
@@ -902,7 +966,7 @@ mod tests {
     }
 
     #[test]
-    fn build_udp_group_ethernet_needs_a_source_mac() {
+    fn build_udp_ethernet_needs_a_source_mac() {
         let no_mac = InterfaceAddresses {
             mac: None,
             ..full_addrs()
@@ -910,10 +974,11 @@ mod tests {
         let dst = SocketAddr::from((Ipv4Addr::BROADCAST, 9));
         let mut scratch = [0u8; 2048];
         assert_eq!(
-            build_udp_group(
+            build_udp(
                 &no_mac,
                 LinkType::Ethernet,
                 dst,
+                MacAddr::broadcast(),
                 4000,
                 64,
                 b"x",
@@ -924,34 +989,17 @@ mod tests {
     }
 
     #[test]
-    fn build_udp_group_rejects_a_unicast_destination() {
-        let dst = SocketAddr::from((Ipv4Addr::new(192, 168, 0, 5), 9));
-        let mut scratch = [0u8; 2048];
-        assert_eq!(
-            build_udp_group(
-                &full_addrs(),
-                LinkType::Ethernet,
-                dst,
-                4000,
-                64,
-                b"x",
-                &mut scratch
-            ),
-            Err(BuildError::UnicastDestination)
-        );
-    }
-
-    #[test]
-    fn build_udp_group_surfaces_a_frame_error() {
+    fn build_udp_surfaces_a_frame_error() {
         // A scratch too small for the frame is a typed BuildError::Frame, not a panic — the
-        // `#[from] FrameError` conversion that send_udp_group then maps onto io::Error.
+        // `#[from] FrameError` conversion that send_udp then maps onto io::Error.
         let dst = SocketAddr::from((Ipv4Addr::BROADCAST, 9));
         let mut tiny = [0u8; 16];
         assert!(matches!(
-            build_udp_group(
+            build_udp(
                 &full_addrs(),
                 LinkType::Ethernet,
                 dst,
+                MacAddr::broadcast(),
                 4000,
                 64,
                 b"x",
@@ -961,21 +1009,23 @@ mod tests {
         ));
     }
 
-    // DLT_NULL (BSD loopback) carries no L2 header, so a MAC-less egress still builds — and
-    // the frame opens with the 4-byte host-order address family, not a MAC.
+    // DLT_NULL (BSD loopback) carries no L2 header, so a MAC-less egress still builds — the frame
+    // opens with the 4-byte host-order address family, not a MAC, and the supplied dst MAC is
+    // ignored (there is no L2 header to place it in).
     #[cfg(any(target_os = "macos", target_os = "freebsd"))]
     #[test]
-    fn build_udp_group_dlt_null_needs_no_mac() {
+    fn build_udp_dlt_null_needs_no_mac() {
         let no_mac = InterfaceAddresses {
             mac: None,
             ..full_addrs()
         };
         let dst = SocketAddr::from((Ipv4Addr::BROADCAST, 9));
         let mut scratch = [0u8; 2048];
-        build_udp_group(
+        build_udp(
             &no_mac,
             LinkType::DltNull,
             dst,
+            MacAddr::broadcast(),
             4000,
             64,
             b"wol",
