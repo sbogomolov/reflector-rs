@@ -39,6 +39,24 @@ CONFIGURED_PORT = 40009
 UNCONFIGURED_PORT = 40010
 ANY_MAC_PORT = 40011
 MALFORMED_MAGIC_PAYLOAD_HEX = "ff" * 6 + "0242ac11000a" * 15 + "0242ac11000b"
+# --- mDNS (RFC 6762): multicast group 224.0.0.251 / ff02::fb on UDP 5353. ---
+MDNS_GROUP_V4 = "224.0.0.251"
+MDNS_GROUP_V6 = "ff02::fb"
+MDNS_PORT = 5353
+MDNS_WRONG_PORT = 5354
+# A 12-byte DNS header + "test". The query has QR=0 (flags 0x0000); the response sets QR+AA
+# (flags 0x8400). The reflector classifies on the QR bit alone.
+MDNS_QUERY_HEX = "00000000000100000000000074657374"
+MDNS_RESPONSE_HEX = "00008400000100010000000074657374"
+# 8 bytes: below the 12-byte DNS-header minimum, so classify() returns None and drops it.
+MDNS_SHORT_QUERY_HEX = "0000000000010000"
+# --- Address-change cases: knock out one (interface, family) source on the reflector, prove
+# reflection of that family stops, then restore it and prove it resumes. The reflector reacts on
+# its own event loop after the netlink notification, so each check polls across that async window.
+ADDR_CHANGE_REFLECTED_WINDOW = 4.0
+ADDR_CHANGE_SILENCE_WINDOW = 2.5
+ADDR_CHANGE_SILENCE_CONSECUTIVE = 2
+ADDR_CHANGE_POLL_DEADLINE = 60.0
 # A substring of the line the daemon logs immediately before entering its event loop.
 REFLECTOR_READY_LOG = "running; press Ctrl-C or send SIGTERM to stop"
 RECEIVER_READY_LOG = "receiver ready: UDP socket bound"
@@ -137,7 +155,150 @@ TEST_CASES = [
     ),
 ]
 
-ALL_CASES: list[TestCase] = [*TEST_CASES]
+# mDNS reflection is directional: queries relay source->target ("forward"), responses
+# target->source ("reverse"). Both are relayed verbatim, so the receiver asserts the exact bytes
+# it sent. The drop cases assert nothing arrives (the wrong direction, a too-short payload, or a
+# port the dispatcher filter never passes).
+MDNS_CASES = [
+    TestCase(
+        name="reflects_mdns_query",
+        send_port=MDNS_PORT,
+        receive_port=MDNS_PORT,
+        expect_mac=None,
+        timeout_seconds=5.0,
+        send_payload_hex=MDNS_QUERY_HEX,
+        expect_payload_hex=MDNS_QUERY_HEX,
+        group=MDNS_GROUP_V4,
+        direction="forward",
+    ),
+    TestCase(
+        name="reflects_mdns_response",
+        send_port=MDNS_PORT,
+        receive_port=MDNS_PORT,
+        expect_mac=None,
+        timeout_seconds=5.0,
+        send_payload_hex=MDNS_RESPONSE_HEX,
+        expect_payload_hex=MDNS_RESPONSE_HEX,
+        group=MDNS_GROUP_V4,
+        direction="reverse",
+    ),
+    TestCase(
+        name="reflects_mdns_query_ipv6",
+        send_port=MDNS_PORT,
+        receive_port=MDNS_PORT,
+        expect_mac=None,
+        timeout_seconds=5.0,
+        send_payload_hex=MDNS_QUERY_HEX,
+        expect_payload_hex=MDNS_QUERY_HEX,
+        group=MDNS_GROUP_V6,
+        family=6,
+        direction="forward",
+    ),
+    TestCase(
+        name="reflects_mdns_response_ipv6",
+        send_port=MDNS_PORT,
+        receive_port=MDNS_PORT,
+        expect_mac=None,
+        timeout_seconds=5.0,
+        send_payload_hex=MDNS_RESPONSE_HEX,
+        expect_payload_hex=MDNS_RESPONSE_HEX,
+        group=MDNS_GROUP_V6,
+        family=6,
+        direction="reverse",
+    ),
+    # A query sent target->source hits the target's response-only handler and is dropped.
+    TestCase(
+        name="ignores_mdns_query_in_response_direction",
+        send_port=MDNS_PORT,
+        receive_port=MDNS_PORT,
+        expect_mac=None,
+        timeout_seconds=1.5,
+        send_payload_hex=MDNS_QUERY_HEX,
+        group=MDNS_GROUP_V4,
+        direction="reverse",
+    ),
+    # A response sent source->target hits the source's query-only handler and is dropped.
+    TestCase(
+        name="ignores_mdns_response_in_query_direction",
+        send_port=MDNS_PORT,
+        receive_port=MDNS_PORT,
+        expect_mac=None,
+        timeout_seconds=1.5,
+        send_payload_hex=MDNS_RESPONSE_HEX,
+        group=MDNS_GROUP_V4,
+        direction="forward",
+    ),
+    # 8 bytes < the 12-byte DNS header, so classify() returns None and drops it.
+    TestCase(
+        name="ignores_mdns_too_short_query",
+        send_port=MDNS_PORT,
+        receive_port=MDNS_PORT,
+        expect_mac=None,
+        timeout_seconds=1.5,
+        send_payload_hex=MDNS_SHORT_QUERY_HEX,
+        group=MDNS_GROUP_V4,
+        direction="forward",
+    ),
+    # The dispatcher filter pins dst_port=5353, so a 5354 datagram never reaches a handler.
+    TestCase(
+        name="ignores_mdns_wrong_port",
+        send_port=MDNS_WRONG_PORT,
+        receive_port=MDNS_WRONG_PORT,
+        expect_mac=None,
+        timeout_seconds=1.5,
+        send_payload_hex=MDNS_QUERY_HEX,
+        group=MDNS_GROUP_V4,
+        direction="forward",
+    ),
+]
+
+# Per-protocol probe parameters for the address-change phases: wol sends a magic packet (no payload
+# or group); mdns sends a query to its family's group, relayed verbatim.
+PROBE_SPECS = {
+    "wol": {"port": CONFIGURED_PORT, "payload": None, "group_v4": None, "group_v6": None},
+    "mdns": {
+        "port": MDNS_PORT,
+        "payload": MDNS_QUERY_HEX,
+        "group_v4": MDNS_GROUP_V4,
+        "group_v6": MDNS_GROUP_V6,
+    },
+}
+
+
+@dataclasses.dataclass(frozen=True)
+class Phase:
+    # One knock-out within an address-change case: take down a single (interface, family) source
+    # address on the reflector, prove reflection of `protocol`/`family` stops, then restore it and
+    # prove reflection resumes -- all via real traffic.
+    label: str
+    protocol: str  # "wol" | "mdns" -> PROBE_SPECS
+    family: int  # 4 | 6
+    interface: str  # "source" (wol_src) | "target" (wol_dst): which reflector interface to toggle
+
+
+@dataclasses.dataclass(frozen=True)
+class AddressChangeCase:
+    name: str
+    config: str  # config file (relative to e2e/), defining a dual-family reflector set
+    phases: tuple[Phase, ...]
+
+
+ADDRESS_CHANGE_CASES = [
+    AddressChangeCase(
+        name="mdns_address_change",
+        config="config-addrchange.toml",
+        phases=(
+            # source IPv4: knocking out the source's v4 invalidates its kernel multicast membership,
+            # so the source capture stops seeing v4 queries -- reflection stops at the ingress; the
+            # monitor rejoins on restore. target IPv6: the target is the egress, so the per-packet
+            # source-address gate drops the v6 re-emit; the monitor refreshes egress addrs on restore.
+            Phase(label="source IPv4", protocol="mdns", family=4, interface="source"),
+            Phase(label="target IPv6", protocol="mdns", family=6, interface="target"),
+        ),
+    ),
+]
+
+ALL_CASES: list[TestCase | AddressChangeCase] = [*TEST_CASES, *MDNS_CASES, *ADDRESS_CHANGE_CASES]
 
 
 def format_command(command: list[str]) -> str:
@@ -196,10 +357,14 @@ class DockerE2E:
         self.networks = [self.source_network, self.target_network]
         self.config_path = E2E_DIR / "config.toml"
 
+        self._select_direction(case.direction)
+
+    def _select_direction(self, direction: str) -> None:
         # The sender lives on the network the traffic originates from and the receiver on the other;
-        # "reverse" cases swap which is which. The receiver's interface is pinned so the probe can join
-        # the multicast group on it.
-        if case.direction == "reverse":
+        # "reverse" swaps which is which. The receiver's interface is pinned so the probe can join the
+        # multicast group on it. The address-change runner re-selects per phase (its phases differ in
+        # direction), so this stays a method rather than inline __init__ code.
+        if direction == "reverse":
             self.sender_network, self.sender_ifname = self.target_network, REFLECTOR_TARGET_IFNAME
             self.receiver_network = self.source_network
         else:
@@ -411,7 +576,184 @@ class DockerE2E:
             self.print_reflector_logs()
 
 
-def make_runner(args: argparse.Namespace, case: TestCase) -> DockerE2E:
+class DockerAddressChange(DockerE2E):
+    # Proves the dynamic family bring-up/teardown end to end: with a dual-family reflector running,
+    # knock out one (interface, family) source address at a time and verify -- with real traffic, not
+    # logs -- that reflection of exactly that family stops, then resumes once the address returns. The
+    # reflector reacts on its own event loop after the netlink notification, so every check polls
+    # across that async window. All phases probe forward (source -> target).
+    def __init__(self, args: argparse.Namespace, case: AddressChangeCase) -> None:
+        shim = TestCase(
+            name=case.name,
+            send_port=MDNS_PORT,
+            receive_port=MDNS_PORT,
+            expect_mac=None,
+            timeout_seconds=ADDR_CHANGE_REFLECTED_WINDOW,
+            direction="forward",
+        )
+        super().__init__(args, shim)
+        self.ac = case
+        self.config_path = E2E_DIR / case.config
+
+    def _phase_case(self, phase: Phase, *, expect: bool, timeout: float) -> TestCase:
+        spec = PROBE_SPECS[phase.protocol]
+        is_wol = phase.protocol == "wol"
+        # A direction stops when its re-emit (egress) interface loses the family -- the reliable,
+        # guaranteed mechanism (the per-packet egress send-gate). The target is the egress for forward
+        # queries (source->target); the source is the egress for reverse responses (target->source).
+        # So probe the direction whose egress is the knocked-out interface. (The ingress-membership
+        # path can't be exercised here: our raw AF_PACKET capture taps below the IP membership filter
+        # and the Docker bridge floods multicast, so losing the ingress membership never blinds it.)
+        reverse = not is_wol and phase.interface == "source"
+        direction = "reverse" if reverse else "forward"
+        group = None if is_wol else (spec["group_v6"] if phase.family == 6 else spec["group_v4"])
+        # mDNS queries flow forward, responses reverse: send the kind the probed direction relays.
+        payload = None if is_wol else (MDNS_RESPONSE_HEX if reverse else spec["payload"])
+        return TestCase(
+            name=self.ac.name,
+            send_port=spec["port"],
+            receive_port=spec["port"],
+            expect_mac=(CONFIGURED_MAC if (expect and is_wol) else None),
+            timeout_seconds=timeout,
+            send_mac=(CONFIGURED_MAC if is_wol else None),
+            send_payload_hex=payload,
+            family=phase.family,
+            direction=direction,
+            group=group,
+            expect_payload_hex=(payload if (expect and not is_wol) else None),
+        )
+
+    def _probe(self, phase: Phase, *, expect: bool, timeout: float) -> bool:
+        # One round trip: (re)start a fresh receiver and sender for the phase's family/group, then
+        # report whether the receiver saw the expected packet within `timeout`.
+        docker(["rm", "-f", self.receiver_container, self.sender_container], check=False, echo=False)
+        case = self._phase_case(phase, expect=expect, timeout=timeout)
+        self._select_direction(case.direction)
+        self.start_receiver(case)
+        self.run_sender(case)
+        return docker(["wait", self.receiver_container]).stdout.strip() == "0"
+
+    def _poll_reflected(self, phase: Phase) -> bool:
+        deadline = time.monotonic() + ADDR_CHANGE_POLL_DEADLINE
+        while time.monotonic() < deadline:
+            if self._probe(phase, expect=True, timeout=ADDR_CHANGE_REFLECTED_WINDOW):
+                return True
+        return False
+
+    def _poll_not_reflected(self, phase: Phase) -> bool:
+        # Require consecutive silent windows: while reflection is still up the probe returns quickly
+        # (the reflected packet arrives, failing --expect-none), resetting the streak; only a genuine
+        # teardown yields an unbroken run of silences before the deadline.
+        deadline = time.monotonic() + ADDR_CHANGE_POLL_DEADLINE
+        consecutive = 0
+        while time.monotonic() < deadline:
+            if self._probe(phase, expect=False, timeout=ADDR_CHANGE_SILENCE_WINDOW):
+                consecutive += 1
+                if consecutive >= ADDR_CHANGE_SILENCE_CONSECUTIVE:
+                    return True
+            else:
+                consecutive = 0
+        return False
+
+    def _sidecar(self, script: str, *, capture: bool = False) -> str:
+        # Address changes need CAP_NET_ADMIN and a writable /proc/sys, which the reflector container
+        # (scratch image, NET_RAW only) has by neither. Run a throwaway privileged container in the
+        # reflector's network namespace, so `ip addr` / the disable_ipv6 sysctl act on the very
+        # interfaces the reflector watches -- without widening the reflector's own privileges.
+        result = docker([
+            "run", "--rm", "--privileged", "--network", f"container:{self.reflector_container}",
+            self.args.helper_image, "sh", "-ec", script,
+        ])
+        return result.stdout.strip() if capture else ""
+
+    def _set_address(
+        self, interface: str, family: int, *, up: bool, cidr: str | None = None
+    ) -> str | None:
+        # Bring one (interface, family) source address down or back up. IPv6 toggles the disable_ipv6
+        # sysctl (which drops every v6 address and, on re-enable, lets the kernel regenerate a usable
+        # link-local); v4 has no equivalent, so it deletes and later re-adds the exact CIDR. Returns
+        # the removed v4 CIDR so the caller can restore it.
+        ifname = REFLECTOR_SOURCE_IFNAME if interface == "source" else REFLECTOR_TARGET_IFNAME
+        if family == 6:
+            self._sidecar(f"echo {0 if up else 1} > /proc/sys/net/ipv6/conf/{ifname}/disable_ipv6")
+            return None
+        if up:
+            if cidr is None:
+                raise RuntimeError("restoring an IPv4 address requires the CIDR captured on removal")
+            self._sidecar(f"ip addr add {cidr} dev {ifname}")
+            return cidr
+        captured = self._sidecar(
+            f"ip -o -4 addr show dev {ifname} | awk '/inet /{{print $4; exit}}'", capture=True
+        )
+        if not captured:
+            raise RuntimeError(f"no IPv4 address on {ifname} to remove")
+        self._sidecar(f"ip addr del {captured} dev {ifname}")
+        return captured
+
+    def _run_phase(self, phase: Phase) -> None:
+        desc = f"{self.ac.name} / {phase.label}"
+        print(f"--- phase: {desc} ({phase.protocol} IPv{phase.family}) ---", flush=True)
+
+        if not self._poll_reflected(phase):
+            raise RuntimeError(f"{desc}: no baseline reflection before the change")
+        print(f"{desc}: baseline reflected", flush=True)
+
+        cidr = self._set_address(phase.interface, phase.family, up=False)
+        if not self._poll_not_reflected(phase):
+            raise RuntimeError(
+                f"{desc}: reflection continued after the {phase.interface} IPv{phase.family} "
+                f"address was removed"
+            )
+        print(f"{desc}: reflection stopped after address removal", flush=True)
+
+        self._set_address(phase.interface, phase.family, up=True, cidr=cidr)
+        if not self._poll_reflected(phase):
+            raise RuntimeError(
+                f"{desc}: reflection did not resume after the {phase.interface} IPv{phase.family} "
+                f"address was restored"
+            )
+        print(f"{desc}: reflection resumed after address restore", flush=True)
+
+    def _assert_address_changes_logged(self) -> None:
+        # Full-parity log check (the Rust equivalent of the C++'s capability-down assertion): every
+        # phase removed then restored a source address, so the reflector's AddressMonitor must have
+        # logged both transitions -- with the monitor off it logs neither. And no reflect-failure WARN
+        # may appear: a send attempted on an addressless egress would mean the per-packet gate failed
+        # to catch the drop.
+        logs = docker(["logs", self.reflector_container], check=False)
+        text = f"{logs.stdout}\n{logs.stderr}"
+        for phase in self.ac.phases:
+            ifname = REFLECTOR_SOURCE_IFNAME if phase.interface == "source" else REFLECTOR_TARGET_IFNAME
+            family = f"IPv{phase.family}"
+            for verb in ("lost", "gained"):
+                needle = f"interface {ifname}: {verb} {family}"
+                if needle not in text:
+                    raise RuntimeError(
+                        f"{self.ac.name}: reflector never logged \"{needle}\" -- the address monitor "
+                        f"did not observe the change"
+                    )
+        if "cannot reflect" in text:
+            raise RuntimeError(
+                f"{self.ac.name}: reflector logged a reflect failure -- a send was attempted on an "
+                f"addressless egress (the gate did not catch the drop)"
+            )
+
+    def run(self) -> None:
+        print(f"\n=== {self.ac.name} ===", flush=True)
+        self.setup_networks()
+        self.start_reflector()
+        for phase in self.ac.phases:
+            self._run_phase(phase)
+        self._assert_address_changes_logged()
+        print(f"PASS {self.ac.name}", flush=True)
+        if self.args.show_reflector_logs:
+            time.sleep(0.5)
+            self.print_reflector_logs()
+
+
+def make_runner(args: argparse.Namespace, case: TestCase | AddressChangeCase) -> DockerE2E:
+    if isinstance(case, AddressChangeCase):
+        return DockerAddressChange(args, case)
     return DockerE2E(args, case)
 
 
@@ -419,7 +761,7 @@ def build_reflector_image(image: str) -> None:
     docker(["build", "-t", image, "."], capture=False)
 
 
-def select_cases(case_names: list[str]) -> list[TestCase]:
+def select_cases(case_names: list[str]) -> list[TestCase | AddressChangeCase]:
     if not case_names:
         return ALL_CASES
 

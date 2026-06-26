@@ -1,5 +1,9 @@
 log_level = "debug"
 
+# Reflectors here use the default address-family policy (no address_family set) -- the out-of-the-box
+# config -- so the suite proves IPv4 and IPv6 both reflect under it. config-addrchange.toml pins
+# "dual" to also cover the strict require-both-families policy (and its startup check).
+
 [reflectors.wol-mac]
 source_if = "wol_src"
 target_if = "wol_dst"
@@ -12,3 +16,8 @@ source_if = "wol_src"
 target_if = "wol_dst"
 wol = true
 wol_ports = [40011]
+
+[reflectors.mdns]
+source_if = "wol_src"
+target_if = "wol_dst"
+mdns = true
