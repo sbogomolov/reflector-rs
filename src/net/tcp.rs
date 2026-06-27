@@ -110,7 +110,7 @@ impl TcpSocket {
     /// stops reading under backpressure rather than ever passing an empty slice.
     ///
     /// # Errors
-    /// Propagates a real read error (other than `EINTR`/`EAGAIN`/`EWOULDBLOCK`).
+    /// Propagates a real read error (other than `EAGAIN`/`EWOULDBLOCK`).
     pub(crate) fn recv(&self, buf: &mut [u8]) -> io::Result<RecvOutcome> {
         debug_assert!(
             !buf.is_empty(),
@@ -386,7 +386,7 @@ mod tests {
         let n = spin(|| match server.recv(&mut buf)? {
             RecvOutcome::Ready(0) => panic!("unexpected EOF before the payload"),
             RecvOutcome::Ready(n) => Ok(Some(n)),
-            RecvOutcome::WouldBlock | RecvOutcome::Interrupted => Ok(None),
+            RecvOutcome::WouldBlock => Ok(None),
         });
         assert_eq!(&buf[..n], b"ping");
     }
@@ -408,7 +408,7 @@ mod tests {
         let n = spin(|| match server.recv(&mut buf)? {
             RecvOutcome::Ready(0) => panic!("unexpected EOF before the payload"),
             RecvOutcome::Ready(n) => Ok(Some(n)),
-            RecvOutcome::WouldBlock | RecvOutcome::Interrupted => Ok(None),
+            RecvOutcome::WouldBlock => Ok(None),
         });
         assert_eq!(&buf[..n], b"headbody");
     }

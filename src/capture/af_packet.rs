@@ -153,25 +153,22 @@ impl Capture {
         Ok(())
     }
 
-    /// One `recv` into the buffer, retrying on `EINTR`. Returns `Ok(None)` when it
-    /// would block, or the frame's real length (which may exceed the buffer, since
-    /// `MSG_TRUNC` is set — the caller treats that as an oversized frame).
+    /// One `recv` into the buffer. Returns `Ok(None)` when it would block, or the frame's real
+    /// length (which may exceed the buffer, since `MSG_TRUNC` is set — the caller treats that as an
+    /// oversized frame).
     fn recv_once(&mut self) -> io::Result<Option<usize>> {
-        loop {
-            // SAFETY: `recv` writes up to `buf.len()` bytes into our own buffer.
-            let n = unsafe {
-                libc::recv(
-                    self.fd.as_raw_fd(),
-                    self.buf.as_mut_ptr().cast::<c_void>(),
-                    self.buf.len(),
-                    libc::MSG_TRUNC,
-                )
-            };
-            match crate::sys::classify_recv(n)? {
-                RecvOutcome::Ready(len) => return Ok(Some(len)),
-                RecvOutcome::WouldBlock => return Ok(None),
-                RecvOutcome::Interrupted => {} // EINTR: retry
-            }
+        // SAFETY: `recv` writes up to `buf.len()` bytes into our own buffer.
+        let n = unsafe {
+            libc::recv(
+                self.fd.as_raw_fd(),
+                self.buf.as_mut_ptr().cast::<c_void>(),
+                self.buf.len(),
+                libc::MSG_TRUNC,
+            )
+        };
+        match crate::sys::classify_recv(n)? {
+            RecvOutcome::Ready(len) => Ok(Some(len)),
+            RecvOutcome::WouldBlock => Ok(None),
         }
     }
 }

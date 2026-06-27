@@ -29,16 +29,16 @@ pub(crate) enum RecvOutcome {
     Ready(usize),
     /// `EAGAIN`/`EWOULDBLOCK`: nothing available on a non-blocking fd.
     WouldBlock,
-    /// `EINTR`: interrupted before any data; the caller should retry.
-    Interrupted,
 }
 
 /// Triage a `recv`/`read` return value `n`: a non-negative count is `Ready`, a negative one is
-/// classified by errno into the non-blocking-fd contract (`Interrupted`/`WouldBlock`) or a real
-/// error.
+/// `WouldBlock` on `EAGAIN`/`EWOULDBLOCK` or else a real error. `EINTR` is not special-cased: the
+/// sockets are non-blocking and the shutdown signals install with `SA_RESTART`, so the restartable
+/// recv/read calls auto-restart rather than surfacing `EINTR` (only the non-restartable reactor wait
+/// can, and it retries itself).
 ///
 /// # Errors
-/// Returns the last OS error for any errno other than `EINTR`/`EAGAIN`/`EWOULDBLOCK`.
+/// Returns the last OS error for any errno other than `EAGAIN`/`EWOULDBLOCK`.
 pub(crate) fn classify_recv(n: isize) -> io::Result<RecvOutcome> {
     if n >= 0 {
         return Ok(RecvOutcome::Ready(
@@ -46,9 +46,6 @@ pub(crate) fn classify_recv(n: isize) -> io::Result<RecvOutcome> {
         ));
     }
     let err = io::Error::last_os_error();
-    if err.raw_os_error() == Some(libc::EINTR) {
-        return Ok(RecvOutcome::Interrupted);
-    }
     if would_block(&err) {
         return Ok(RecvOutcome::WouldBlock);
     }

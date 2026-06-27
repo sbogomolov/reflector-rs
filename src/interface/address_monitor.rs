@@ -56,7 +56,7 @@ impl AddressMonitor {
     ///
     /// # Errors
     /// The first non-recoverable recv failure. Recoverable: `EAGAIN`/`EWOULDBLOCK` end the
-    /// drain, `EINTR` retries, `ENOBUFS` reports the overflow signal and continues.
+    /// drain, `ENOBUFS` reports the overflow signal and continues.
     pub(crate) fn drain(&mut self, mut on_change: impl FnMut(u32)) -> io::Result<()> {
         loop {
             // SAFETY: `recv` fills up to `buf.len()` bytes of the owned buffer.
@@ -81,7 +81,6 @@ impl AddressMonitor {
                 RecvOutcome::Ready(len) => {
                     backend::for_each_change(&self.buf[..len], &mut on_change);
                 }
-                RecvOutcome::Interrupted => {} // EINTR: retry
             }
         }
     }

@@ -228,20 +228,17 @@ impl Capture {
     /// Read one kernel batch into `buf`. Returns `false` if nothing is available
     /// (would block) or the device reported EOF.
     fn refill(&mut self) -> io::Result<bool> {
-        let bytes = loop {
-            // SAFETY: writing up to `buf.len()` bytes into our own buffer.
-            let n = unsafe {
-                libc::read(
-                    self.fd.as_raw_fd(),
-                    self.buf.as_mut_ptr().cast(),
-                    self.buf.len(),
-                )
-            };
-            match crate::sys::classify_recv(n)? {
-                RecvOutcome::Ready(len) => break len,
-                RecvOutcome::WouldBlock => return Ok(false),
-                RecvOutcome::Interrupted => {} // EINTR: retry
-            }
+        // SAFETY: writing up to `buf.len()` bytes into our own buffer.
+        let n = unsafe {
+            libc::read(
+                self.fd.as_raw_fd(),
+                self.buf.as_mut_ptr().cast(),
+                self.buf.len(),
+            )
+        };
+        let bytes = match crate::sys::classify_recv(n)? {
+            RecvOutcome::Ready(len) => len,
+            RecvOutcome::WouldBlock => return Ok(false),
         };
         if bytes == 0 {
             return Ok(false);
