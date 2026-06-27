@@ -86,41 +86,67 @@ struct Connection {
     deadline: Instant,
 }
 
+/// Which way bytes flow on one edge of the splice. `ClientToDevice` is the `c2u` flow — a request read
+/// from the client and forwarded to the device (its `Host` rewritten); `DeviceToClient` is `u2c` — a
+/// response read from the device and forwarded to the client (verbatim).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Direction {
+    ClientToDevice,
+    DeviceToClient,
+}
+
+/// One `Direction` resolved against a connection: the socket to read from, the socket to forward to
+/// (and its registration), that direction's framing and buffers, and the rewrite to apply. Built once
+/// per event by [`Connection::context`] so the forward/drain paths never re-pick a side.
+struct DirectionContext<'a> {
+    from: &'a TcpSocket,
+    to: &'a TcpSocket,
+    to_reg: Option<RegKey>,
+    flow: &'a mut Flow,
+    host_rewrite: Option<SocketAddrV4>,
+    deadline: &'a mut Instant,
+}
+
 impl Connection {
-    /// Forward one readable edge in the given direction, then arm the destination's write interest iff
-    /// an unsent backlog remains. `reading_client` picks the direction: the client's bytes become a
-    /// request to the device (its `Host` rewritten to the device's own authority), the device's bytes
-    /// become a response to the client (verbatim for now). Returns `true` to close.
-    fn forward(&mut self, reading_client: bool, reactor: &mut Reactor) -> bool {
-        let close = if reading_client {
-            forward_dir(
-                &self.client,
-                &self.device,
-                &mut self.c2u,
-                Some(self.device_endpoint),
-                &mut self.deadline,
-            )
-        } else {
-            forward_dir(
-                &self.device,
-                &self.client,
-                &mut self.u2c,
-                None,
-                &mut self.deadline,
-            )
-        };
-        if close {
-            return true;
+    /// The resolved view for `direction` — the sockets, registration, flow, rewrite, and deadline it
+    /// touches — so the forward/drain paths operate without re-picking a side.
+    fn context(&mut self, direction: Direction) -> DirectionContext<'_> {
+        match direction {
+            Direction::ClientToDevice => DirectionContext {
+                from: &self.client,
+                to: &self.device,
+                to_reg: self.device_reg,
+                flow: &mut self.c2u,
+                host_rewrite: Some(self.device_endpoint),
+                deadline: &mut self.deadline,
+            },
+            Direction::DeviceToClient => DirectionContext {
+                from: &self.device,
+                to: &self.client,
+                to_reg: self.client_reg,
+                flow: &mut self.u2c,
+                host_rewrite: None,
+                deadline: &mut self.deadline,
+            },
         }
-        self.sync_write_interest(reading_client, reactor)
     }
 
-    /// A connection socket is writable: complete the device connect if still pending, drain whichever
-    /// side's send backlog this fd carries, then leave its write interest armed iff a backlog remains
-    /// (so a fully-drained buffer disarms — including the bare connect-completion case). Returns `true`
-    /// to close.
-    fn on_writable(&mut self, fd: RawFd, reactor: &mut Reactor) -> bool {
-        if self.device.as_raw_fd() == fd && self.device.is_connecting() {
+    /// Forward one readable edge in `direction`, then arm the destination's write interest iff an
+    /// unsent backlog remains. Returns `true` to close.
+    fn forward(&mut self, direction: Direction, reactor: &mut Reactor) -> bool {
+        let mut ctx = self.context(direction);
+        if ctx.forward() {
+            return true;
+        }
+        ctx.sync_write_interest(reactor)
+    }
+
+    /// A connection socket is writable: complete the device connect if still pending, drain
+    /// `direction`'s send backlog, then leave its write interest armed iff a backlog remains (so a
+    /// fully-drained buffer disarms — including the bare connect-completion case). Returns `true` to
+    /// close.
+    fn on_writable(&mut self, direction: Direction, reactor: &mut Reactor) -> bool {
+        if direction == Direction::ClientToDevice && self.device.is_connecting() {
             match self.device.finish_connect() {
                 Ok(()) => self.deadline = Instant::now() + IDLE_TIMEOUT,
                 Err(e) => {
@@ -132,82 +158,104 @@ impl Connection {
                 }
             }
         }
-        let writing_device = self.device.as_raw_fd() == fd;
-        let close = if writing_device {
-            drain_side(&self.device, &mut self.c2u.send, &mut self.deadline)
-        } else {
-            drain_side(&self.client, &mut self.u2c.send, &mut self.deadline)
-        };
-        if close {
+        let mut ctx = self.context(direction);
+        if ctx.drain() {
             return true;
         }
-        self.sync_write_interest(writing_device, reactor)
+        ctx.sync_write_interest(reactor)
+    }
+}
+
+impl DirectionContext<'_> {
+    /// Read one chunk from the source, frame whole messages out of this direction's buffer, and forward
+    /// each — rewriting `Host` when set — to the destination, buffering any unsent tail in the send
+    /// buffer for the writable edge to drain. The deadline is refreshed (by the senders) only when bytes
+    /// actually reach the destination, so a wedged one still ages out via the idle sweep. Returns `true`
+    /// to close: peer EOF, a framing/recv/send error, or a backpressure overflow. Reactor-free, so the
+    /// splice is unit-testable without standing up a reactor.
+    fn forward(&mut self) -> bool {
+        let tail = self.flow.recv.free_tail_mut();
+        if tail.is_empty() {
+            log::warn!("dial: receive buffer full of an unframable message; closing");
+            return true;
+        }
+        let n = match self.from.recv(tail) {
+            Ok(IoStatus::Ready(0)) => return true, // peer half-closed: tear the splice down
+            Ok(IoStatus::Ready(n)) => n,
+            Ok(IoStatus::WouldBlock) => return false, // a spurious wake, nothing new
+            Err(e) => {
+                log::debug!("dial: recv failed: {e}");
+                return true;
+            }
+        };
+        self.flow.recv.commit(n);
+        loop {
+            let framed = match self
+                .flow
+                .framer
+                .feed(self.flow.recv.pending(), self.host_rewrite)
+            {
+                Ok(framed) => framed,
+                Err(e) => {
+                    log::debug!("dial: framing error: {e:?}");
+                    return true;
+                }
+            };
+            if framed.consumed == 0 {
+                break; // an incomplete message: wait for more bytes
+            }
+            let consumed = framed.consumed;
+            if send_framed(
+                self.to,
+                &mut self.flow.send,
+                framed.header,
+                framed.body,
+                self.deadline,
+            ) {
+                return true;
+            }
+            self.flow.recv.consume(consumed);
+        }
+        false
     }
 
-    /// Arm the destination side's write interest to match its send backlog (armed iff the backlog is
-    /// non-empty); `to_device` selects the destination — the device when reading the client / draining
-    /// toward the device, the client otherwise. Returns `true` to close: the reactor rejected the
-    /// change, which would otherwise strand the buffered send with no later re-arm for a quiet reader.
-    fn sync_write_interest(&self, to_device: bool, reactor: &mut Reactor) -> bool {
-        let (to_reg, backlog) = if to_device {
-            (self.device_reg, !self.c2u.send.is_empty())
-        } else {
-            (self.client_reg, !self.u2c.send.is_empty())
-        };
-        let reg = to_reg.expect("a persisted connection has its registration set");
+    /// Drain as much of this direction's send backlog as the destination will take now, refreshing the
+    /// deadline on real progress. Returns `true` to close on a send error; the caller re-evaluates write
+    /// interest from the buffer's emptiness.
+    fn drain(&mut self) -> bool {
+        if self.flow.send.is_empty() {
+            return false;
+        }
+        match self.to.send(self.flow.send.pending()) {
+            Ok(IoStatus::Ready(n)) => {
+                self.flow.send.consume(n);
+                if n > 0 {
+                    *self.deadline = Instant::now() + IDLE_TIMEOUT;
+                }
+                false
+            }
+            Ok(IoStatus::WouldBlock) => false,
+            Err(e) => {
+                log::debug!("dial: draining send to peer failed: {e}");
+                true
+            }
+        }
+    }
+
+    /// Arm the destination's write interest to match its send backlog (armed iff non-empty). Returns
+    /// `true` to close: the reactor rejected the change, which would otherwise strand the buffered send
+    /// with no later re-arm for a quiet reader.
+    fn sync_write_interest(&self, reactor: &mut Reactor) -> bool {
+        let backlog = !self.flow.send.is_empty();
+        let reg = self
+            .to_reg
+            .expect("a persisted connection has its registration set");
         if reactor.set_write_interest(reg, backlog).is_err() {
             log::warn!("dial: updating write interest failed; closing");
             return true;
         }
         false
     }
-}
-
-/// Read one chunk from `from`, frame whole messages out of the direction's buffer, and forward each —
-/// rewriting `Host` to `host_rewrite` when set — to `to`, buffering any unsent tail in `flow.send` for
-/// the writable edge to drain. `deadline` is refreshed (by the senders) only when bytes actually reach
-/// `to`, so a wedged destination still ages out via the idle sweep. Returns `true` to close: peer EOF,
-/// a framing/recv/send error, or a backpressure overflow.
-fn forward_dir(
-    from: &TcpSocket,
-    to: &TcpSocket,
-    flow: &mut Flow,
-    host_rewrite: Option<SocketAddrV4>,
-    deadline: &mut Instant,
-) -> bool {
-    let tail = flow.recv.free_tail_mut();
-    if tail.is_empty() {
-        log::warn!("dial: receive buffer full of an unframable message; closing");
-        return true;
-    }
-    let n = match from.recv(tail) {
-        Ok(IoStatus::Ready(0)) => return true, // peer half-closed: tear the splice down
-        Ok(IoStatus::Ready(n)) => n,
-        Ok(IoStatus::WouldBlock) => return false, // a spurious wake, nothing new
-        Err(e) => {
-            log::debug!("dial: recv failed: {e}");
-            return true;
-        }
-    };
-    flow.recv.commit(n);
-    loop {
-        let framed = match flow.framer.feed(flow.recv.pending(), host_rewrite) {
-            Ok(framed) => framed,
-            Err(e) => {
-                log::debug!("dial: framing error: {e:?}");
-                return true;
-            }
-        };
-        if framed.consumed == 0 {
-            break; // an incomplete message: wait for more bytes
-        }
-        let consumed = framed.consumed;
-        if send_framed(to, &mut flow.send, framed.header, framed.body, deadline) {
-            return true;
-        }
-        flow.recv.consume(consumed);
-    }
-    false
 }
 
 /// Send `header` then `body` to `to`, preserving order: if `to` already has a backlog or is still
@@ -262,28 +310,6 @@ fn split_remainder<'a>(header: &'a [u8], body: &'a [u8], sent: usize) -> (&'a [u
         (&[], &body[sent - header.len()..])
     } else {
         (&header[sent..], body)
-    }
-}
-
-/// Drain as much of `to_send` as `to` will take now, refreshing `deadline` on real progress. Returns
-/// `true` to close on a send error; the caller re-evaluates write interest from `to_send`'s emptiness.
-fn drain_side(to: &TcpSocket, to_send: &mut StreamBuffer, deadline: &mut Instant) -> bool {
-    if to_send.is_empty() {
-        return false;
-    }
-    match to.send(to_send.pending()) {
-        Ok(IoStatus::Ready(n)) => {
-            to_send.consume(n);
-            if n > 0 {
-                *deadline = Instant::now() + IDLE_TIMEOUT;
-            }
-            false
-        }
-        Ok(IoStatus::WouldBlock) => false,
-        Err(e) => {
-            log::debug!("dial: draining send to peer failed: {e}");
-            true
-        }
     }
 }
 
@@ -433,8 +459,13 @@ impl DialDeviceProxy {
                 log::trace!("dial: readable event for an unknown connection; ignoring");
                 return;
             };
-            let reading_client = conn.client.as_raw_fd() == fd;
-            conn.forward(reading_client, reactor)
+            // The readable fd is the source: reading the client forwards to the device (c2u).
+            let direction = if conn.client.as_raw_fd() == fd {
+                Direction::ClientToDevice
+            } else {
+                Direction::DeviceToClient
+            };
+            conn.forward(direction, reactor)
         };
         if close {
             self.close_conn(conn_key, reactor);
@@ -455,7 +486,13 @@ impl DialDeviceProxy {
                 log::trace!("dial: writable event for an unknown connection; ignoring");
                 return;
             };
-            conn.on_writable(fd, reactor)
+            // The writable fd is the destination: draining toward the device is the c2u flow's send.
+            let direction = if conn.device.as_raw_fd() == fd {
+                Direction::ClientToDevice
+            } else {
+                Direction::DeviceToClient
+            };
+            conn.on_writable(direction, reactor)
         };
         if close {
             self.close_conn(conn_key, reactor);
@@ -576,9 +613,17 @@ mod tests {
         let mut deadline = Instant::now();
         let mut buf = [0u8; 1024];
         for _ in 0..2000 {
+            let mut ctx = DirectionContext {
+                from,
+                to,
+                to_reg: None,
+                flow: &mut *flow,
+                host_rewrite: rewrite,
+                deadline: &mut deadline,
+            };
             assert!(
-                !forward_dir(from, to, flow, rewrite, &mut deadline),
-                "forward_dir should not close on a clean message"
+                !ctx.forward(),
+                "forward should not close on a clean message"
             );
             match peer_out.recv(&mut buf).expect("recv on the peer") {
                 IoStatus::Ready(0) => panic!("unexpected EOF before the forwarded bytes"),
