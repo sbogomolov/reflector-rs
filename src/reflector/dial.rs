@@ -5,8 +5,10 @@
 //!
 //! Lifecycle, dispatch, and the bidirectional byte splice: accept, egress-pinned connect, the
 //! connect/idle deadlines, per-direction HTTP framing and forwarding (the request's `Host` rewritten
-//! to the device), drop-and-close backpressure, teardown, and self-eviction. The response's
-//! `Application-URL`/`Location` rewrite through a lazily-minted REST listener follows in the next step.
+//! to the device), drop-and-close backpressure, independent per-direction half-close (one side's EOF
+//! flushes its remaining bytes and FINs the peer while the reverse direction keeps flowing), teardown,
+//! and self-eviction. The response's `Application-URL`/`Location` rewrite through a lazily-minted REST
+//! listener follows in the next step.
 
 use std::io;
 use std::net::{Ipv4Addr, SocketAddrV4};
@@ -35,12 +37,24 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// the buffer fills and the always-armed reader livelocks.
 const _: () = assert!(MAX_RECV > crate::net::http::framing::MAX_HEADER);
 
+/// A direction's half-close progress. `Open` while both ends are live; `SourceClosed` once the source
+/// sent EOF and we are flushing whatever was still buffered toward the destination; `Done` once that
+/// flush completes and we have shut our write to the destination. A connection closes once both are `Done`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FlowState {
+    Open,
+    SourceClosed,
+    Done,
+}
+
 /// One direction of the duplex splice: its HTTP framer, the recv buffer (bytes read from the source
-/// side), and the send buffer (the unsent tail to the destination side under backpressure).
+/// side), the send buffer (the unsent tail to the destination side under backpressure), and its
+/// half-close state.
 struct Flow {
     framer: HttpFraming,
     recv: StreamBuffer,
     send: StreamBuffer,
+    state: FlowState,
 }
 
 impl Flow {
@@ -49,6 +63,7 @@ impl Flow {
             framer: HttpFraming::new(kind),
             recv: StreamBuffer::with_capacity(MAX_RECV),
             send: StreamBuffer::with_capacity(MAX_SEND),
+            state: FlowState::Open,
         }
     }
 }
@@ -95,11 +110,29 @@ enum Direction {
     DeviceToClient,
 }
 
-/// One `Direction` resolved against a connection: the socket to read from, the socket to forward to
-/// (and its registration), that direction's framing and buffers, and the rewrite to apply. Built once
-/// per event by [`Connection::context`] so the forward/drain paths never re-pick a side.
+/// Whether to keep a connection or tear it down — the keep/close decision the per-edge handlers
+/// return, clearer than a bare bool.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Outcome {
+    Keep,
+    Close,
+}
+
+/// What one [`DirectionContext::forward`] pass concluded: more may follow (`Open`), the source
+/// half-closed so flush-then-finish (`SourceEof`), or a fatal error (`Failed`).
+enum Forwarded {
+    Open,
+    SourceEof,
+    Failed,
+}
+
+/// One `Direction` resolved against a connection: the socket to read from (and its registration, to
+/// disarm on half-close), the socket to forward to (and its registration), that direction's framing and
+/// buffers, and the rewrite to apply. Built once per event by [`Connection::context`] so the
+/// forward/drain paths never re-pick a side.
 struct DirectionContext<'a> {
     from: &'a TcpSocket,
+    from_reg: Option<RegKey>,
     to: &'a TcpSocket,
     to_reg: Option<RegKey>,
     flow: &'a mut Flow,
@@ -114,6 +147,7 @@ impl Connection {
         match direction {
             Direction::ClientToDevice => DirectionContext {
                 from: &self.client,
+                from_reg: self.client_reg,
                 to: &self.device,
                 to_reg: self.device_reg,
                 flow: &mut self.c2u,
@@ -122,6 +156,7 @@ impl Connection {
             },
             Direction::DeviceToClient => DirectionContext {
                 from: &self.device,
+                from_reg: self.device_reg,
                 to: &self.client,
                 to_reg: self.client_reg,
                 flow: &mut self.u2c,
@@ -131,21 +166,98 @@ impl Connection {
         }
     }
 
-    /// Forward one readable edge in `direction`, then arm the destination's write interest iff an
-    /// unsent backlog remains. Returns `true` to close.
-    fn forward(&mut self, direction: Direction, reactor: &mut Reactor) -> bool {
-        let mut ctx = self.context(direction);
-        if ctx.forward() {
-            return true;
+    /// Fold a per-direction `outcome` into the connection's: an explicit `Close`, or close once both
+    /// directions have finished their half-close (both `Done`); otherwise keep the connection.
+    fn close_if_complete(&self, outcome: Outcome) -> Outcome {
+        if outcome == Outcome::Close
+            || (self.c2u.state == FlowState::Done && self.u2c.state == FlowState::Done)
+        {
+            Outcome::Close
+        } else {
+            Outcome::Keep
         }
-        ctx.sync_write_interest(reactor)
+    }
+
+    /// `direction`'s source peer has fully hung up. Whatever it already sent may still be buffered toward
+    /// the *other*, still-live peer, so finish delivering that (`settle` drains it asynchronously, then
+    /// FINs). The reverse direction is dead — its destination is the vanished peer — so abandon it
+    /// (`Done`, dropping its now-undeliverable buffer) and disarm its source read, lest a stray edge
+    /// re-enter and tear us down early. Unwatch the vanished fd, whose level-triggered HUP would
+    /// otherwise re-fire every wait. The connection then closes once the forward flow finishes draining.
+    fn peer_gone(&mut self, direction: Direction, reactor: &mut Reactor) -> Outcome {
+        // Abandon the reverse direction (its destination is the vanished peer) and resolve the reg whose
+        // read to disarm — that abandoned flow's source — and the hung-up fd to unwatch. The guard routes
+        // here only with a live destination reg, and the source's reg is still set (its fd just hung up,
+        // and peer_gone, which takes it, runs once), so both expects hold.
+        let (disarm_reg, unwatch_reg) = match direction {
+            Direction::ClientToDevice => {
+                self.u2c.state = FlowState::Done; // the response can't reach the gone client
+                (
+                    self.device_reg
+                        .expect("a live destination keeps its registration"),
+                    self.client_reg
+                        .take()
+                        .expect("the hung-up source still has its registration"),
+                )
+            }
+            Direction::DeviceToClient => {
+                self.c2u.state = FlowState::Done; // the request can't reach the gone device
+                (
+                    self.client_reg
+                        .expect("a live destination keeps its registration"),
+                    self.device_reg
+                        .take()
+                        .expect("the hung-up source still has its registration"),
+                )
+            }
+        };
+        // Disarm the abandoned reverse's source read and unwatch the hung-up fd. A failure is rare (a
+        // reactor syscall on a live fd), but ignoring it is unsafe: a still-watched hung-up fd would
+        // re-fire its HUP, re-enter here, and find its reg already taken. Wind the connection down.
+        if reactor.set_read_interest(disarm_reg, false).is_err()
+            || reactor.unwatch(unwatch_reg).is_err()
+        {
+            log::warn!("dial: winding down a hung-up peer failed; closing");
+            return Outcome::Close;
+        }
+        if self.context(direction).settle(reactor) == Outcome::Close {
+            return Outcome::Close;
+        }
+        self.close_if_complete(Outcome::Keep)
+    }
+
+    /// Forward one readable edge in `direction`: splice the bytes, then on the source's EOF begin its
+    /// half-close (flush the rest, FIN the destination, keep the reverse direction flowing), on a fatal
+    /// error tear down, otherwise arm the destination's write interest to its backlog.
+    fn forward(&mut self, direction: Direction, reactor: &mut Reactor) -> Outcome {
+        let mut ctx = self.context(direction);
+        // A non-Open flow means we already disarmed this source's read when it half-closed, yet it woke
+        // us again — only a hangup/reset does that, since epoll delivers HUP/ERR regardless of the read
+        // mask. The source peer is fully gone. If its destination is gone too (a prior `peer_gone` took
+        // that reg, leaving it `None`), both peers have vanished — close. Otherwise wind down, finishing
+        // any backlog still owed to the live destination, rather than re-running the half-close.
+        if ctx.flow.state != FlowState::Open {
+            return if ctx.to_reg.is_none() {
+                Outcome::Close
+            } else {
+                self.peer_gone(direction, reactor)
+            };
+        }
+        let forwarded = ctx.forward();
+        let outcome = match forwarded {
+            Forwarded::Failed => Outcome::Close,
+            Forwarded::SourceEof => ctx.half_close(reactor),
+            Forwarded::Open => ctx.sync_write_interest(reactor),
+        };
+        self.close_if_complete(outcome)
     }
 
     /// A connection socket is writable: complete the device connect if still pending, drain
-    /// `direction`'s send backlog, then leave its write interest armed iff a backlog remains (so a
-    /// fully-drained buffer disarms — including the bare connect-completion case). Returns `true` to
-    /// close.
-    fn on_writable(&mut self, direction: Direction, reactor: &mut Reactor) -> bool {
+    /// `direction`'s send backlog, then settle its half-close (FIN the destination once a closed
+    /// source's backlog has flushed) and leave its write interest armed iff a backlog remains (so a
+    /// fully-drained buffer disarms — including the bare connect-completion case). Returns `Close` to
+    /// tear down.
+    fn on_writable(&mut self, direction: Direction, reactor: &mut Reactor) -> Outcome {
         if direction == Direction::ClientToDevice && self.device.is_connecting() {
             match self.device.finish_connect() {
                 Ok(()) => self.deadline = Instant::now() + IDLE_TIMEOUT,
@@ -154,15 +266,16 @@ impl Connection {
                         "dial: device connect to {} failed: {e}",
                         self.device_endpoint
                     );
-                    return true;
+                    return Outcome::Close;
                 }
             }
         }
         let mut ctx = self.context(direction);
-        if ctx.drain() {
-            return true;
+        if ctx.drain() == Outcome::Close {
+            return Outcome::Close;
         }
-        ctx.sync_write_interest(reactor)
+        let outcome = ctx.settle(reactor);
+        self.close_if_complete(outcome)
     }
 }
 
@@ -171,21 +284,21 @@ impl DirectionContext<'_> {
     /// each — rewriting `Host` when set — to the destination, buffering any unsent tail in the send
     /// buffer for the writable edge to drain. The deadline is refreshed (by the senders) only when bytes
     /// actually reach the destination, so a wedged one still ages out via the idle sweep. Returns `true`
-    /// to close: peer EOF, a framing/recv/send error, or a backpressure overflow. Reactor-free, so the
-    /// splice is unit-testable without standing up a reactor.
-    fn forward(&mut self) -> bool {
+    /// to close: a framing/recv/send error or a backpressure overflow (`Failed`); the source half-closed
+    /// (`SourceEof`); otherwise `Open`. Reactor-free, so the splice is unit-testable without a reactor.
+    fn forward(&mut self) -> Forwarded {
         let tail = self.flow.recv.free_tail_mut();
         if tail.is_empty() {
             log::warn!("dial: receive buffer full of an unframable message; closing");
-            return true;
+            return Forwarded::Failed;
         }
         let n = match self.from.recv(tail) {
-            Ok(IoStatus::Ready(0)) => return true, // peer half-closed: tear the splice down
+            Ok(IoStatus::Ready(0)) => return Forwarded::SourceEof, // the peer half-closed its write
             Ok(IoStatus::Ready(n)) => n,
-            Ok(IoStatus::WouldBlock) => return false, // a spurious wake, nothing new
+            Ok(IoStatus::WouldBlock) => return Forwarded::Open, // a spurious wake, nothing new
             Err(e) => {
                 log::debug!("dial: recv failed: {e}");
-                return true;
+                return Forwarded::Failed;
             }
         };
         self.flow.recv.commit(n);
@@ -198,7 +311,7 @@ impl DirectionContext<'_> {
                 Ok(framed) => framed,
                 Err(e) => {
                     log::debug!("dial: framing error: {e:?}");
-                    return true;
+                    return Forwarded::Failed;
                 }
             };
             if framed.consumed == 0 {
@@ -211,20 +324,55 @@ impl DirectionContext<'_> {
                 framed.header,
                 framed.body,
                 self.deadline,
-            ) {
-                return true;
+            ) == Outcome::Close
+            {
+                return Forwarded::Failed;
             }
             self.flow.recv.consume(consumed);
         }
-        false
+        Forwarded::Open
+    }
+
+    /// The source half-closed (sent EOF): stop reading it — its FIN is now permanently readable, so
+    /// disarming read interest is what keeps it from re-firing — mark the flow `SourceClosed`, then
+    /// settle. The destination stays open and writable, so the reverse direction keeps delivering to the
+    /// half-closing peer. `Close` if the reactor rejects the disarm.
+    fn half_close(&mut self, reactor: &mut Reactor) -> Outcome {
+        let reg = self
+            .from_reg
+            .expect("a persisted connection has its registration set");
+        if reactor.set_read_interest(reg, false).is_err() {
+            log::warn!("dial: disarming the half-closed source failed; closing");
+            return Outcome::Close;
+        }
+        self.flow.state = FlowState::SourceClosed;
+        self.settle(reactor)
+    }
+
+    /// Settle a flow after a forward or drain: if its source has closed and its backlog is now flushed,
+    /// FIN the destination (propagating the end) and mark the flow `Done`; then arm the destination's
+    /// write interest to whatever backlog remains — a fully-drained flow disarms it, so `on_writable`
+    /// never re-enters here and the FIN fires exactly once. `Close` if the reactor rejects the change.
+    fn settle(&mut self, reactor: &mut Reactor) -> Outcome {
+        // Defer finishing while the destination is still connecting: `shutdown_write` would be an
+        // `ENOTCONN` no-op (the FIN lost) and `Done` a lie. The connect-completion edge — kept armed by
+        // `sync_write_interest` below — drives `finish_connect`, after which a later settle finishes.
+        if self.flow.state == FlowState::SourceClosed
+            && self.flow.send.is_empty()
+            && !self.to.is_connecting()
+        {
+            self.to.shutdown_write();
+            self.flow.state = FlowState::Done;
+        }
+        self.sync_write_interest(reactor)
     }
 
     /// Drain as much of this direction's send backlog as the destination will take now, refreshing the
-    /// deadline on real progress. Returns `true` to close on a send error; the caller re-evaluates write
-    /// interest from the buffer's emptiness.
-    fn drain(&mut self) -> bool {
+    /// deadline on real progress. `Close` on a send error; otherwise `Keep` (the caller re-evaluates
+    /// write interest from the buffer's emptiness).
+    fn drain(&mut self) -> Outcome {
         if self.flow.send.is_empty() {
-            return false;
+            return Outcome::Keep;
         }
         match self.to.send(self.flow.send.pending()) {
             Ok(IoStatus::Ready(n)) => {
@@ -232,29 +380,31 @@ impl DirectionContext<'_> {
                 if n > 0 {
                     *self.deadline = Instant::now() + IDLE_TIMEOUT;
                 }
-                false
+                Outcome::Keep
             }
-            Ok(IoStatus::WouldBlock) => false,
+            Ok(IoStatus::WouldBlock) => Outcome::Keep,
             Err(e) => {
                 log::debug!("dial: draining send to peer failed: {e}");
-                true
+                Outcome::Close
             }
         }
     }
 
-    /// Arm the destination's write interest to match its send backlog (armed iff non-empty). Returns
-    /// `true` to close: the reactor rejected the change, which would otherwise strand the buffered send
-    /// with no later re-arm for a quiet reader.
-    fn sync_write_interest(&self, reactor: &mut Reactor) -> bool {
-        let backlog = !self.flow.send.is_empty();
+    /// Arm the destination's write interest to its send backlog (armed iff non-empty), or while it is
+    /// still connecting so the connect-completion edge survives. `Close` if the reactor rejects the
+    /// change, which would otherwise strand the buffered send with no later re-arm for a quiet reader.
+    fn sync_write_interest(&self, reactor: &mut Reactor) -> Outcome {
+        // Arm on a backlog to drain it, or while the destination is still connecting so its
+        // connect-completion edge (a writable edge with no backlog) still wakes us.
+        let armed = !self.flow.send.is_empty() || self.to.is_connecting();
         let reg = self
             .to_reg
             .expect("a persisted connection has its registration set");
-        if reactor.set_write_interest(reg, backlog).is_err() {
+        if reactor.set_write_interest(reg, armed).is_err() {
             log::warn!("dial: updating write interest failed; closing");
-            return true;
+            return Outcome::Close;
         }
-        false
+        Outcome::Keep
     }
 }
 
@@ -269,7 +419,7 @@ fn send_framed(
     header: &[u8],
     body: &[u8],
     deadline: &mut Instant,
-) -> bool {
+) -> Outcome {
     if !to_send.is_empty() || to.is_connecting() {
         return buffer_tail(to_send, header, body);
     }
@@ -279,7 +429,7 @@ fn send_framed(
         Ok(IoStatus::WouldBlock) => 0,
         Err(e) => {
             log::debug!("dial: send to peer failed: {e}");
-            return true;
+            return Outcome::Close;
         }
     };
     if sent > 0 {
@@ -287,19 +437,19 @@ fn send_framed(
         *deadline = Instant::now() + IDLE_TIMEOUT;
     }
     if sent == total {
-        return false;
+        return Outcome::Keep;
     }
     let (header_tail, body_tail) = split_remainder(header, body, sent);
     buffer_tail(to_send, header_tail, body_tail)
 }
 
-/// Append the unsent `header`/`body` remainder to `to_send`; `true` if it overflows the cap (close).
-fn buffer_tail(to_send: &mut StreamBuffer, header: &[u8], body: &[u8]) -> bool {
+/// Append the unsent `header`/`body` remainder to `to_send`; `Close` if it overflows the cap.
+fn buffer_tail(to_send: &mut StreamBuffer, header: &[u8], body: &[u8]) -> Outcome {
     if to_send.append(header).is_err() || to_send.append(body).is_err() {
         log::warn!("dial: send buffer overflow; closing");
-        return true;
+        return Outcome::Close;
     }
-    false
+    Outcome::Keep
 }
 
 /// Split a `header`+`body` pair at the `sent` bytes already written front-to-back, giving the unsent
@@ -454,7 +604,7 @@ impl DialDeviceProxy {
         fd: RawFd,
         reactor: &mut Reactor,
     ) {
-        let close = {
+        let outcome = {
             let Some(conn) = self.conns.get_mut(conn_key.0) else {
                 log::trace!("dial: readable event for an unknown connection; ignoring");
                 return;
@@ -467,7 +617,7 @@ impl DialDeviceProxy {
             };
             conn.forward(direction, reactor)
         };
-        if close {
+        if outcome == Outcome::Close {
             self.close_conn(conn_key, reactor);
         }
     }
@@ -479,7 +629,7 @@ impl DialDeviceProxy {
         fd: RawFd,
         reactor: &mut Reactor,
     ) {
-        let close = {
+        let outcome = {
             let Some(conn) = self.conns.get_mut(conn_key.0) else {
                 // The reactor filters stale registrations, so a live write event should map to a live
                 // connection; a miss means the generational key out-lived its slot — fail safe.
@@ -494,7 +644,7 @@ impl DialDeviceProxy {
             };
             conn.on_writable(direction, reactor)
         };
-        if close {
+        if outcome == Outcome::Close {
             self.close_conn(conn_key, reactor);
         }
     }
@@ -615,6 +765,7 @@ mod tests {
         for _ in 0..2000 {
             let mut ctx = DirectionContext {
                 from,
+                from_reg: None,
                 to,
                 to_reg: None,
                 flow: &mut *flow,
@@ -622,8 +773,8 @@ mod tests {
                 deadline: &mut deadline,
             };
             assert!(
-                !ctx.forward(),
-                "forward should not close on a clean message"
+                matches!(ctx.forward(), Forwarded::Open),
+                "forward should stay open on a clean message"
             );
             match peer_out.recv(&mut buf).expect("recv on the peer") {
                 IoStatus::Ready(0) => panic!("unexpected EOF before the forwarded bytes"),
@@ -650,6 +801,13 @@ mod tests {
         let (header, body) = split_remainder(b"head", b"body", 2);
         assert_eq!(header, b"ad");
         assert_eq!(body, b"body");
+    }
+
+    #[test]
+    fn buffer_tail_keeps_within_cap_and_closes_on_overflow() {
+        let mut send = StreamBuffer::with_capacity(4);
+        assert_eq!(buffer_tail(&mut send, b"ab", b"cd"), Outcome::Keep); // fills the 4-byte cap
+        assert_eq!(buffer_tail(&mut send, b"x", b""), Outcome::Close); // past it: drop-and-close
     }
 
     #[test]
@@ -698,5 +856,244 @@ mod tests {
             String::from_utf8_lossy(&got)
         );
         assert!(got.ends_with(b"hello"), "body forwarded: {got:?}");
+    }
+
+    #[test]
+    fn forward_reports_source_eof_when_the_peer_closes_its_write() {
+        let (peer_in, from) = connected_pair();
+        let (to, _peer_out) = connected_pair();
+        drop(peer_in); // the source's peer closes → `from` observes EOF
+        let mut flow = Flow::new(Kind::Request);
+        let mut deadline = Instant::now();
+        let outcome = loop {
+            let mut ctx = DirectionContext {
+                from: &from,
+                from_reg: None,
+                to: &to,
+                to_reg: None,
+                flow: &mut flow,
+                host_rewrite: None,
+                deadline: &mut deadline,
+            };
+            match ctx.forward() {
+                Forwarded::Open => sleep(Duration::from_millis(1)), // FIN not observed yet
+                terminal => break terminal,
+            }
+        };
+        assert!(matches!(outcome, Forwarded::SourceEof));
+    }
+
+    /// A do-nothing handler — only needed so the reactor will hand out registrations for the
+    /// state-machine tests below (they drive `Connection` directly, never through dispatch).
+    struct NoopHandler;
+    impl Handler for NoopHandler {
+        fn on_readable(&mut self, _event: ReadyEvent, _reactor: &mut Reactor) {}
+    }
+
+    /// A reactor plus a `Connection` whose client/device sockets are watched loopback pairs, with the
+    /// far ends returned so a test can drive traffic and observe what the proxy forwards: `client_peer`
+    /// stands in for the DIAL client, `device_peer` for the device.
+    fn watched_connection() -> (Reactor, Connection, TcpSocket, TcpSocket) {
+        let mut reactor = Reactor::new().expect("reactor");
+        let key = reactor.register(Box::new(NoopHandler));
+        let (client_peer, client) = connected_pair(); // the proxy accepted the client
+        let (device, device_peer) = connected_pair(); // the proxy connected to the device
+        let client_reg = reactor
+            .watch(key, client.as_raw_fd(), 0)
+            .expect("watch client");
+        let device_reg = reactor
+            .watch(key, device.as_raw_fd(), 0)
+            .expect("watch device");
+        let conn = Connection {
+            client,
+            client_reg: Some(client_reg),
+            device,
+            device_reg: Some(device_reg),
+            device_endpoint: SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 5), 8008),
+            c2u: Flow::new(Kind::Request),
+            u2c: Flow::new(Kind::Response),
+            deadline: Instant::now(),
+        };
+        (reactor, conn, client_peer, device_peer)
+    }
+
+    /// Read `sock` until EOF, returning everything received (panics if EOF never arrives on loopback).
+    fn drain_to_eof(sock: &TcpSocket) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut buf = [0u8; 256];
+        for _ in 0..2000 {
+            match sock.recv(&mut buf).expect("recv") {
+                IoStatus::Ready(0) => return out,
+                IoStatus::Ready(n) => out.extend_from_slice(&buf[..n]),
+                IoStatus::WouldBlock => sleep(Duration::from_millis(1)),
+            }
+        }
+        panic!("EOF never arrived on loopback");
+    }
+
+    /// Drive `forward` on the client→device edge until the flow reaches `Done` (or the budget runs out).
+    fn drive_c2u_to_done(conn: &mut Connection, reactor: &mut Reactor) {
+        for _ in 0..2000 {
+            conn.forward(Direction::ClientToDevice, reactor);
+            if conn.c2u.state == FlowState::Done {
+                return;
+            }
+            sleep(Duration::from_millis(1));
+        }
+        panic!("c2u never reached Done");
+    }
+
+    #[test]
+    fn close_if_complete_closes_only_when_both_flows_are_done() {
+        let (_reactor, mut conn, _client_peer, _device_peer) = watched_connection();
+        // Both Open: keep.
+        assert_eq!(conn.close_if_complete(Outcome::Keep), Outcome::Keep);
+        // One side done, the other still open: keep (the half-close isn't finished).
+        conn.c2u.state = FlowState::Done;
+        assert_eq!(conn.close_if_complete(Outcome::Keep), Outcome::Keep);
+        // Both done: close.
+        conn.u2c.state = FlowState::Done;
+        assert_eq!(conn.close_if_complete(Outcome::Keep), Outcome::Close);
+        // An explicit Close wins regardless of the flow states.
+        conn.c2u.state = FlowState::Open;
+        conn.u2c.state = FlowState::Open;
+        assert_eq!(conn.close_if_complete(Outcome::Close), Outcome::Close);
+    }
+
+    #[test]
+    fn forward_eof_finishes_the_flow_and_fins_the_destination() {
+        let (mut reactor, mut conn, client_peer, device_peer) = watched_connection();
+        // The client sends a full request, then closes its write half (a FIN after the bytes).
+        assert!(matches!(
+            client_peer
+                .send(b"GET /apps HTTP/1.1\r\nHost: 192.168.1.2:80\r\n\r\n")
+                .expect("send request"),
+            IoStatus::Ready(_)
+        ));
+        drop(client_peer);
+        // The readable edges forward the request (Open), then observe EOF: Open -> SourceClosed ->
+        // (empty backlog) -> Done.
+        drive_c2u_to_done(&mut conn, &mut reactor);
+        assert_eq!(conn.c2u.state, FlowState::Done);
+        // The device received the Host-rewritten request and then our FIN (EOF terminates the drain).
+        let got = drain_to_eof(&device_peer);
+        assert!(
+            contains(&got, b"Host: 10.0.0.5:8008\r\n"),
+            "request forwarded before the FIN: {:?}",
+            String::from_utf8_lossy(&got)
+        );
+    }
+
+    #[test]
+    fn half_close_holds_in_source_closed_until_the_backlog_drains() {
+        let (mut reactor, mut conn, _client_peer, device_peer) = watched_connection();
+        // A backlog still owed to the device at the moment the client half-closes.
+        conn.c2u
+            .send
+            .append(b"GET / HTTP/1.1\r\n\r\n")
+            .expect("buffer a backlog");
+        // Half-close with bytes still pending: the flow holds at SourceClosed, not Done.
+        assert_eq!(
+            conn.context(Direction::ClientToDevice)
+                .half_close(&mut reactor),
+            Outcome::Keep
+        );
+        assert_eq!(conn.c2u.state, FlowState::SourceClosed);
+        // Draining the backlog (a writable edge) then finishes the flow.
+        for _ in 0..2000 {
+            conn.on_writable(Direction::ClientToDevice, &mut reactor);
+            if conn.c2u.state == FlowState::Done {
+                break;
+            }
+            sleep(Duration::from_millis(1));
+        }
+        assert_eq!(conn.c2u.state, FlowState::Done);
+        let got = drain_to_eof(&device_peer);
+        assert!(
+            got.starts_with(b"GET / HTTP/1.1\r\n"),
+            "the backlog reached the device before the FIN: {:?}",
+            String::from_utf8_lossy(&got)
+        );
+    }
+
+    #[test]
+    fn source_hangup_with_no_backlog_tears_down() {
+        let (mut reactor, mut conn, _client_peer, _device_peer) = watched_connection();
+        // A readable edge once the flow is past Open is a hangup on the disarmed source. With nothing
+        // owed to the live peer, winding down finishes both directions at once -> close.
+        conn.c2u.state = FlowState::SourceClosed;
+        assert_eq!(
+            conn.forward(Direction::ClientToDevice, &mut reactor),
+            Outcome::Close
+        );
+        // Same once the flow is already Done.
+        let (mut reactor, mut conn, _client_peer, _device_peer) = watched_connection();
+        conn.c2u.state = FlowState::Done;
+        assert_eq!(
+            conn.forward(Direction::ClientToDevice, &mut reactor),
+            Outcome::Close
+        );
+    }
+
+    #[test]
+    fn source_hangup_still_drains_the_forward_backlog() {
+        let (mut reactor, mut conn, _client_peer, device_peer) = watched_connection();
+        // The client half-closed with a request still buffered toward the (live) device...
+        conn.c2u
+            .send
+            .append(b"GET /apps HTTP/1.1\r\n\r\n")
+            .expect("buffer a backlog");
+        conn.c2u.state = FlowState::SourceClosed;
+        // ...then the client fully hangs up: a readable edge on the disarmed source.
+        assert_eq!(
+            conn.forward(Direction::ClientToDevice, &mut reactor),
+            Outcome::Keep,
+            "keep the connection to drain the request, don't drop it"
+        );
+        assert_eq!(
+            conn.u2c.state,
+            FlowState::Done,
+            "the reverse direction is abandoned — the client is gone"
+        );
+        assert!(
+            conn.client_reg.is_none(),
+            "the hung-up client fd is unwatched so its HUP stops re-firing"
+        );
+        // Draining finishes the forward flow; the device receives the whole request, then our FIN.
+        for _ in 0..2000 {
+            conn.on_writable(Direction::ClientToDevice, &mut reactor);
+            if conn.c2u.state == FlowState::Done {
+                break;
+            }
+            sleep(Duration::from_millis(1));
+        }
+        assert_eq!(conn.c2u.state, FlowState::Done);
+        let got = drain_to_eof(&device_peer);
+        assert!(
+            got.starts_with(b"GET /apps HTTP/1.1\r\n"),
+            "the full request reached the device before the FIN: {:?}",
+            String::from_utf8_lossy(&got)
+        );
+    }
+
+    #[test]
+    fn both_peers_hangup_closes_without_panic() {
+        let (mut reactor, mut conn, _client_peer, _device_peer) = watched_connection();
+        // Both directions still owe a backlog to their (about-to-vanish) peers.
+        conn.c2u.send.append(b"req").expect("buffer c2u");
+        conn.u2c.send.append(b"resp").expect("buffer u2c");
+        conn.c2u.state = FlowState::SourceClosed;
+        conn.u2c.state = FlowState::SourceClosed;
+        // The client hangs up: peer_gone keeps the connection to drain the request to the live device.
+        assert_eq!(
+            conn.forward(Direction::ClientToDevice, &mut reactor),
+            Outcome::Keep
+        );
+        // Then the device hangs up too — its registration is already gone, so nothing is left to
+        // deliver: close, and (the regression) without panicking in settle/sync_write_interest.
+        assert_eq!(
+            conn.forward(Direction::DeviceToClient, &mut reactor),
+            Outcome::Close
+        );
     }
 }

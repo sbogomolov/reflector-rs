@@ -327,7 +327,6 @@ impl Reactor {
     ///
     /// # Errors
     /// Returns an error if updating the kernel's read interest fails.
-    #[allow(dead_code)] // wired in by the DIAL half-close drain (a later step)
     pub(crate) fn set_read_interest(&mut self, reg_key: RegKey, enabled: bool) -> io::Result<bool> {
         let Some(registration) = self.registrations.get_mut(reg_key.0) else {
             log::trace!("set_read_interest: {reg_key:?} already gone");
