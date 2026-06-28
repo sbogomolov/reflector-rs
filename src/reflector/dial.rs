@@ -8,7 +8,8 @@
 //! the device, the response's `Application-URL`/`Location` to the proxy's REST/description listeners),
 //! drop-and-close backpressure, independent per-direction half-close (one side's EOF flushes its
 //! remaining bytes and FINs the peer while the reverse direction keeps flowing), teardown, and
-//! self-eviction. Accepting on the REST listener (its own connections) follows in the next step.
+//! self-eviction. Constructing and registering one of these per advertised device — the SSDP
+//! `LOCATION` rewrite that mints it — lives in the SSDP reflector and follows in the next step.
 
 use std::io;
 use std::net::{Ipv4Addr, SocketAddrV4};
@@ -533,25 +534,47 @@ impl DialDeviceProxy {
             .expect("adopt_key sets the proxy's key before any dispatch")
     }
 
-    /// Accept one pending client on the description listener and start its proxied connection. The
-    /// listener is non-blocking, so a level-triggered wait re-fires while more wait; an accept is
-    /// always taken (draining the readiness) even at the connection cap, where the client is dropped.
-    fn accept(&mut self, reactor: &mut Reactor) {
-        let client = match self.desc.accept() {
+    /// Accept one pending client on `listener` if there is connection capacity, else `None`. The
+    /// listeners are non-blocking, so a level-triggered wait re-fires while more wait; an accept is
+    /// always taken (draining the readiness) even at the shared connection cap, where the client is
+    /// dropped. `what` names the listener for the log.
+    fn accept_client(&self, listener: &TcpSocket, what: &str) -> Option<TcpSocket> {
+        let client = match listener.accept() {
             Ok(Some(client)) => client,
-            Ok(None) => return, // spurious / already taken
+            Ok(None) => return None, // spurious / already taken
             Err(e) => {
-                log::warn!("dial: accept on the description listener failed: {e}");
-                return;
+                log::warn!("dial: accept on the {what} listener failed: {e}");
+                return None;
             }
         };
         if self.conns.iter().count() >= MAX_CONNECTIONS {
             log::warn!("dial: connection cap ({MAX_CONNECTIONS}) reached; dropping a new client");
-            return; // `client` drops here, closing it
+            return None; // `client` drops here, closing it
         }
-        let device = self.desc_endpoint;
-        let own_listener = self.desc.local_addr();
-        self.start_connection(client, device, own_listener, reactor);
+        Some(client)
+    }
+
+    /// Accept a client on the description listener and proxy it to the device's description endpoint.
+    fn accept_desc(&mut self, reactor: &mut Reactor) {
+        if let Some(client) = self.accept_client(&self.desc, "description") {
+            self.start_connection(client, self.desc_endpoint, self.desc.local_addr(), reactor);
+        }
+    }
+
+    /// Accept a client on the REST listener and proxy it to the device's REST endpoint — learned from a
+    /// prior description fetch. A client reaching the REST listener before that fetch (the proxy minted
+    /// the listener's address into the description's `Application-URL`, so this is unexpected) is dropped.
+    fn accept_rest(&mut self, reactor: &mut Reactor) {
+        let Some(client) = self.accept_client(&self.rest, "REST") else {
+            return;
+        };
+        let Some(device) = self.rest_endpoint else {
+            log::warn!(
+                "dial: REST request before the device's REST endpoint is known; dropping it"
+            );
+            return; // `client` drops here, closing it
+        };
+        self.start_connection(client, device, self.rest.local_addr(), reactor);
     }
 
     /// Open an egress-pinned connection to `device_endpoint`, register both fds, and record the
@@ -732,7 +755,9 @@ impl Handler for DialDeviceProxy {
 
     fn on_readable(&mut self, event: ReadyEvent, reactor: &mut Reactor) {
         if event.fd == self.desc.as_raw_fd() {
-            self.accept(reactor);
+            self.accept_desc(reactor);
+        } else if event.fd == self.rest.as_raw_fd() {
+            self.accept_rest(reactor);
         } else {
             self.on_connection_readable(
                 ConnectionKey::from_u64(event.user_data),
@@ -1191,6 +1216,88 @@ mod tests {
         assert_eq!(
             conn.forward(Direction::DeviceToClient, &mut reactor),
             Outcome::Close
+        );
+    }
+
+    /// A proxy with bound loopback desc/rest listeners, its key borrowed from a placeholder handler (as
+    /// `watched_connection` does) so `start_connection`'s watches resolve without dispatching through the
+    /// reactor. Returns the proxy and its REST listener address (a client connects there to reach
+    /// `accept_rest`). `rest_endpoint` starts unlearned (`None`).
+    fn watched_proxy(reactor: &mut Reactor) -> (DialDeviceProxy, SocketAddrV4) {
+        let key = reactor.register(Box::new(NoopHandler));
+        let desc = TcpSocket::listen(Ipv4Addr::LOCALHOST).expect("desc listen");
+        let rest = TcpSocket::listen(Ipv4Addr::LOCALHOST).expect("rest listen");
+        let rest_addr = rest.local_addr();
+        let mut proxy = DialDeviceProxy::new(
+            Ipv4Addr::LOCALHOST,
+            Ipv4Addr::LOCALHOST,
+            0, // no egress pin on loopback
+            desc,
+            SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 5), 8008),
+            Instant::now() + Duration::from_secs(30), // a grace far past the test's lifetime
+            rest,
+        );
+        proxy.adopt_key(key);
+        (proxy, rest_addr)
+    }
+
+    #[test]
+    fn accept_rest_proxies_to_the_learned_rest_endpoint() {
+        let mut reactor = Reactor::new().expect("reactor");
+        let (mut proxy, rest_addr) = watched_proxy(&mut reactor);
+        // A loopback stand-in for the device's REST endpoint a prior description fetch revealed.
+        let device = TcpSocket::listen(Ipv4Addr::LOCALHOST).expect("device REST listen");
+        let device_endpoint = device.local_addr();
+        proxy.rest_endpoint = Some(device_endpoint);
+
+        // A client reaches the REST listener; drive accept until the loopback handshake lands.
+        let _client =
+            TcpSocket::connect(rest_addr, Ipv4Addr::LOCALHOST, 0).expect("client connect");
+        for _ in 0..2000 {
+            proxy.accept_rest(&mut reactor);
+            if proxy.conns.iter().count() == 1 {
+                break;
+            }
+            sleep(Duration::from_millis(1));
+        }
+
+        let (_, conn) = proxy
+            .conns
+            .iter()
+            .next()
+            .expect("a REST connection was started");
+        assert_eq!(
+            conn.device_endpoint, device_endpoint,
+            "the REST connection targets the learned REST endpoint, not the description endpoint"
+        );
+    }
+
+    #[test]
+    fn accept_rest_drops_a_client_before_the_rest_endpoint_is_learned() {
+        let mut reactor = Reactor::new().expect("reactor");
+        let (mut proxy, rest_addr) = watched_proxy(&mut reactor); // rest_endpoint stays None
+        let client = TcpSocket::connect(rest_addr, Ipv4Addr::LOCALHOST, 0).expect("client connect");
+
+        // accept_rest accepts the client (draining the listener) but, with no learned endpoint, drops
+        // it — so the client observes EOF and no connection is recorded.
+        let mut buf = [0u8; 1];
+        let mut closed = false;
+        for _ in 0..2000 {
+            proxy.accept_rest(&mut reactor);
+            if matches!(client.recv(&mut buf), Ok(IoStatus::Ready(0))) {
+                closed = true;
+                break;
+            }
+            sleep(Duration::from_millis(1));
+        }
+        assert!(
+            closed,
+            "the proxy accepted then closed the unservable REST client"
+        );
+        assert_eq!(
+            proxy.conns.iter().count(),
+            0,
+            "no connection is started before the REST endpoint is known"
         );
     }
 }
