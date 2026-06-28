@@ -11,8 +11,8 @@
 //! and their watched fds come and go; [`Reactor::poll_once`] waits for readiness and
 //! dispatches it. A [`Handler`] is registered once and **owns** the fds it
 //! [`watch`](Reactor::watch)es; each fd is watched under its own [`RegKey`], so an event
-//! names the exact fd and the reactor dispatches the owning handler with the `reg_key`/`fd`
-//! that fired. Unwatching (or unregistering) removes the kernel interest *first*, then
+//! names the exact fd and the reactor dispatches the owning handler for the fd that fired.
+//! Unwatching (or unregistering) removes the kernel interest *first*, then
 //! the handler drops and closes the fds — so interest is always gone before a fd closes:
 //! no stale-interest window, and no fd the reactor double-owns (a capture socket the
 //! handler also needs for I/O stays owned by the handler).
@@ -59,18 +59,17 @@ pub(crate) struct RegKey(Key);
 
 /// Callbacks for a registered handler. The handler **owns** the fds it watches and keeps
 /// them open while watched; the reactor only watches them. Each fd is watched under its
-/// own [`RegKey`], so readiness on any one dispatches the handler with the `reg_key`/`fd`
-/// that fired.
+/// own [`RegKey`], so readiness on any one dispatches the handler with the `fd` that fired.
 ///
 /// `on_readable` is required; `on_writable` defaults to a no-op and only fires while
 /// write interest is armed for that fd (see [`Reactor::set_write_interest`]). Each is
 /// handed `&mut Reactor`, so a handler can watch/unwatch fds, register or unregister
 /// others, arm/disarm its own write interest, etc.
 pub(crate) trait Handler {
-    /// The fd that `event.reg_key` addresses is readable.
+    /// The fd `event.fd` is readable.
     fn on_readable(&mut self, event: ReadyEvent, reactor: &mut Reactor);
 
-    /// The fd that `event.reg_key` addresses is writable and its write interest is armed.
+    /// The fd `event.fd` is writable and its write interest is armed.
     fn on_writable(&mut self, _event: ReadyEvent, _reactor: &mut Reactor) {}
 
     /// The earliest instant this handler wants [`on_deadline`](Self::on_deadline) called, or `None`
@@ -102,18 +101,11 @@ pub(crate) struct Readiness {
     pub(crate) writable: bool,
 }
 
-/// What fired, handed to [`Handler::on_readable`] / [`Handler::on_writable`]: the
-/// registration key (for [`set_write_interest`]/[`unwatch`]), the fd, and the opaque
-/// `user_data` the handler attached at [`watch`]. The reactor never interprets
+/// What fired, handed to [`Handler::on_readable`] / [`Handler::on_writable`]: the fd, and the opaque
+/// `user_data` the handler attached at [`watch`](Reactor::watch). The reactor never interprets
 /// `user_data` — a handler can pack a key, an index, or anything into it.
-///
-/// [`set_write_interest`]: Reactor::set_write_interest
-/// [`unwatch`]: Reactor::unwatch
-/// [`watch`]: Reactor::watch
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ReadyEvent {
-    /// The registration whose fd is ready.
-    pub(crate) reg_key: RegKey,
     /// The fd that is ready.
     pub(crate) fd: RawFd,
     /// The opaque value the handler passed to [`watch`](Reactor::watch).
@@ -467,7 +459,6 @@ impl Reactor {
         };
         let handler_key = registration.handler_key;
         let event = ReadyEvent {
-            reg_key,
             fd: registration.fd,
             user_data: registration.user_data,
         };
@@ -557,7 +548,8 @@ mod tests {
     type TimerAction = Box<dyn FnMut(Instant, &mut Reactor)>;
 
     struct TestHandler {
-        fd: OwnedFd,
+        /// Owned only to keep the watched fd open for the handler's life (its `Drop` closes it).
+        _fd: OwnedFd,
         on_read: Action,
         on_write: Option<Action>,
     }
@@ -568,7 +560,7 @@ mod tests {
             action: impl FnMut(ReadyEvent, &mut Reactor) + 'static,
         ) -> Box<dyn Handler> {
             Box::new(Self {
-                fd,
+                _fd: fd,
                 on_read: Box::new(action),
                 on_write: None,
             })
@@ -580,7 +572,7 @@ mod tests {
             write: impl FnMut(ReadyEvent, &mut Reactor) + 'static,
         ) -> Box<dyn Handler> {
             Box::new(Self {
-                fd,
+                _fd: fd,
                 on_read: Box::new(read),
                 on_write: Some(Box::new(write)),
             })
@@ -742,11 +734,17 @@ mod tests {
         let (a, _peer) = pair();
         let raw = a.as_raw_fd();
         let writes = Rc::new(Cell::new(0u32));
+        let reg: Rc<Cell<Option<RegKey>>> = Rc::new(Cell::new(None));
         // The read phase disarms write interest on its own reg before the write phase.
         let handler = TestHandler::read_write(
             a,
-            |event, reactor| {
-                reactor.set_write_interest(event.reg_key, false).unwrap();
+            {
+                let reg = reg.clone();
+                move |_event, reactor| {
+                    reactor
+                        .set_write_interest(reg.get().unwrap(), false)
+                        .unwrap();
+                }
             },
             {
                 let writes = writes.clone();
@@ -754,6 +752,7 @@ mod tests {
             },
         );
         let (_hk, rk) = watch1(&mut reactor, handler, raw);
+        reg.set(Some(rk));
         reactor.set_write_interest(rk, true).unwrap();
 
         // Both ready, but the read handler disarms write before the write phase.
@@ -887,7 +886,6 @@ mod tests {
         let event = seen.get().expect("handler fired");
         assert_eq!(event.user_data, 0xdead_beef); // the token round-trips
         assert_eq!(event.fd, raw);
-        assert_eq!(event.reg_key, rk);
     }
 
     #[test]

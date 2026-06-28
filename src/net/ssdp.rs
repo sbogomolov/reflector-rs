@@ -1,7 +1,5 @@
 //! SSDP wire constants and the search/advertisement classifier — the reflector's directional gate.
 
-// The DIAL proxy hook (a later step) is the only consumer; until it lands this is inert.
-#[allow(dead_code)]
 pub(crate) mod dial;
 
 use std::net::{Ipv4Addr, Ipv6Addr};

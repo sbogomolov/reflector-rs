@@ -383,13 +383,6 @@ pub(crate) struct RewritePolicy {
 }
 
 impl RewritePolicy {
-    /// A policy that rewrites nothing — every authority header passes through unchanged.
-    pub(crate) const NONE: Self = Self {
-        host: None,
-        application_url: None,
-        location: None,
-    };
-
     /// The address `header` should be rewritten to under this policy, or `None` to leave it unchanged.
     fn target(&self, header: AuthorityHeader) -> Option<SocketAddrV4> {
         match header {
@@ -430,6 +423,16 @@ fn append_authority(buf: &mut Vec<u8>, addr: SocketAddrV4) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    impl RewritePolicy {
+        /// A no-op policy — every authority header passes through unchanged. Tests only; the proxy
+        /// always frames with a live policy.
+        pub(crate) const NONE: Self = Self {
+            host: None,
+            application_url: None,
+            location: None,
+        };
+    }
 
     /// A rewrite policy that sends every authority header to `repl`.
     fn rewrite_all(repl: SocketAddrV4) -> RewritePolicy {

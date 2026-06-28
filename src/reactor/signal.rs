@@ -45,7 +45,8 @@ extern "C" fn on_signal(_signum: c_int) {
 /// restores those dispositions, unpublishes the fd, and closes the write end — in
 /// that order, so no signal can reach a handler that points at a closed fd.
 pub(crate) struct ShutdownPipe {
-    write_fd: OwnedFd,
+    /// The self-pipe's write end, held only so its `OwnedFd` `Drop` closes it when the guard drops.
+    _write_fd: OwnedFd,
     saved_actions: [libc::sigaction; SHUTDOWN_SIGNALS.len()],
 }
 
@@ -77,7 +78,7 @@ impl ShutdownPipe {
         };
         Ok((
             Self {
-                write_fd: write,
+                _write_fd: write,
                 saved_actions: saved,
             },
             SignalPipe { read },
@@ -88,7 +89,7 @@ impl ShutdownPipe {
 impl Drop for ShutdownPipe {
     fn drop(&mut self) {
         // Order matters: stop signals reaching our handler, then unpublish the fd;
-        // `self.write_fd` closes last (after this body), when nothing can touch it.
+        // `self._write_fd` closes last (after this body), when nothing can touch it.
         restore_handlers(&self.saved_actions);
         WRITE_FD.store(-1, Ordering::SeqCst);
     }

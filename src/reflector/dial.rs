@@ -498,9 +498,6 @@ pub(crate) struct DialDeviceProxy {
     /// This handler's own key, learned via [`adopt_key`](Handler::adopt_key); used to watch fds it
     /// opens and to self-unregister.
     key: Option<HandlerKey>,
-    /// The source-interface address the description (and REST) listener binds — clients reach the
-    /// proxy here.
-    source: Ipv4Addr,
     /// The target-interface address device connections bind, so the device sees a same-segment peer
     /// and replies via the target interface (on the BSDs the bind is the only egress steer).
     target: Ipv4Addr,
@@ -520,12 +517,12 @@ pub(crate) struct DialDeviceProxy {
 }
 
 impl DialDeviceProxy {
-    /// A proxy fronting `desc_endpoint` via the source-side `desc` listener. Device connections bind the
-    /// target-interface `target` and egress-pin `target_ifindex`. The proxy's lifetime (eviction past the
-    /// advertisement's grace) is owned by the [`DialContext`](crate::dispatch::DialContext) registry, not
-    /// the proxy itself, since the proxy never sees the advertisements that refresh it.
+    /// A proxy fronting `desc_endpoint` via the source-side `desc` listener (already bound by the caller).
+    /// Device connections bind the target-interface `target` and egress-pin `target_ifindex`. The proxy's
+    /// lifetime (eviction past the advertisement's grace) is owned by the
+    /// [`DialContext`](crate::dispatch::DialContext) registry, not the proxy itself, since the proxy never
+    /// sees the advertisements that refresh it.
     pub(crate) fn new(
-        source: Ipv4Addr,
         target: Ipv4Addr,
         target_ifindex: u32,
         desc: TcpSocket,
@@ -534,7 +531,6 @@ impl DialDeviceProxy {
     ) -> Self {
         Self {
             key: None,
-            source,
             target,
             target_ifindex,
             desc,
@@ -799,7 +795,6 @@ impl Handler for DialDeviceProxy {
 
 /// The description-listener grace when an advertisement carries no `CACHE-CONTROL: max-age` — the
 /// UDA-recommended minimum device validity (DIAL's own example advertises `max-age=1800`).
-#[allow(dead_code)] // the SSDP DIAL hook wires this in (next commit)
 const DEFAULT_DESC_GRACE: Duration = Duration::from_mins(30);
 
 /// Bytes a reflector reserves on the stack to rewrite one SSDP datagram into. Anchored to the
@@ -807,7 +802,6 @@ const DEFAULT_DESC_GRACE: Duration = Duration::from_mins(30);
 /// its outgoing frame there, so a datagram that doesn't fit it can't be forwarded at all — sizing the
 /// rewrite scratch to it holds any rewritten datagram the reflector could send. A `LOCATION` rewrite can
 /// grow the datagram; one that still overruns this falls back to verbatim rather than truncating.
-#[allow(dead_code)] // the SSDP DIAL hook wires this in (next commit)
 pub(crate) const REWRITE_BUF_LEN: usize = crate::dispatch::SCRATCH_LEN;
 
 /// Rewrite a DIAL discovery message's `LOCATION` to point at a source-side description proxy, minting and
@@ -819,7 +813,6 @@ pub(crate) const REWRITE_BUF_LEN: usize = crate::dispatch::SCRATCH_LEN;
 /// rewritten datagram is sent immediately, so it need not outlive the call. `source`/`target` are the
 /// source/target interface IPv4 addresses: the proxy binds its listeners on `source` and egress-pins
 /// device connections to `target`/`ifindex`.
-#[allow(dead_code)] // the SSDP DIAL hook wires this in (next commit)
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn rewrite_location(
     ctx: &mut DialContext,
@@ -884,7 +877,6 @@ pub(crate) fn rewrite_location(
 /// Mint a description proxy for `endpoint`, register it on `reactor`, and record it in `ctx`; returns the
 /// source-side description-listener address to rewrite the `LOCATION` to. `None` (logged) at the proxy
 /// cap or on a listen/register failure, leaving the `LOCATION` unrewritten.
-#[allow(dead_code)] // the SSDP DIAL hook wires this in (next commit)
 #[allow(clippy::too_many_arguments)]
 fn mint_proxy(
     ctx: &mut DialContext,
@@ -904,7 +896,7 @@ fn mint_proxy(
     let rest = listen_or_warn(source, Listener::Rest)?;
     let desc_addr = desc.local_addr();
     let watches = [(desc.as_raw_fd(), 0), (rest.as_raw_fd(), 0)];
-    let proxy = DialDeviceProxy::new(source, target, ifindex, desc, endpoint, rest);
+    let proxy = DialDeviceProxy::new(target, ifindex, desc, endpoint, rest);
     let handler = match reactor.register_with_fds(Box::new(proxy), &watches) {
         Ok(handler) => handler,
         Err(e) => {
@@ -918,7 +910,6 @@ fn mint_proxy(
 }
 
 /// Bind a source-side listener, logging and yielding `None` on failure; `what` names it for the log.
-#[allow(dead_code)] // the SSDP DIAL hook wires this in (next commit)
 fn listen_or_warn(source: Ipv4Addr, what: Listener) -> Option<TcpSocket> {
     match TcpSocket::listen(source) {
         Ok(listener) => Some(listener),
@@ -1371,7 +1362,6 @@ mod tests {
         let rest = TcpSocket::listen(Ipv4Addr::LOCALHOST).expect("rest listen");
         let rest_addr = rest.local_addr();
         let mut proxy = DialDeviceProxy::new(
-            Ipv4Addr::LOCALHOST,
             Ipv4Addr::LOCALHOST,
             0, // no egress pin on loopback
             desc,

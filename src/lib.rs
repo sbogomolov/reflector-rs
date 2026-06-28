@@ -11,11 +11,6 @@ mod error;
 mod interface;
 mod logging;
 mod net;
-// The reactor is a complete reactor; the synchronous-send WoL data path drives only a subset.
-// Its write-interest path (set_write_interest, unwatch, ReadyEvent's reg_key/fd) awaits the DIAL
-// TCP proxy, and a couple of utilities (the arena's iter, the self-pipe's RAII write end) have no
-// caller yet. Allow dead code in the module until those land.
-#[allow(dead_code)]
 mod reactor;
 mod reflector;
 mod sys;
