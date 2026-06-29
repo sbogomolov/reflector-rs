@@ -58,9 +58,10 @@ pub(crate) enum BuildError {
     /// Names a `source_if` / `target_if` that `run()` opened no capture for — a wiring bug.
     #[error("no capture for interface \"{0}\"")]
     UnknownInterface(String),
-    /// The target interface can't currently send a family the reflector requires, so it would
-    /// reflect nothing for that family — a startup failure rather than a silent half-run.
-    #[error("target interface \"{interface}\" cannot send {family}, required by the reflector")]
+    /// An interface can't currently send a family the reflector requires, so it would reflect
+    /// nothing for that family — a startup failure rather than a silent half-run. For a
+    /// bidirectional reflector (mDNS/SSDP) the named interface may be the source or the target.
+    #[error("interface \"{interface}\" cannot send {family}, required by the reflector")]
     RequiredFamilyUnavailable { interface: String, family: IpFamily },
 }
 
