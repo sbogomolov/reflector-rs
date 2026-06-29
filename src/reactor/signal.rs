@@ -117,6 +117,9 @@ impl Handler for SignalPipe {
         // SAFETY: `self.read` is the registered, non-blocking read end; draining
         // stops at EOF (0) or EAGAIN (-1).
         while unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
+        // A once-per-process control event, so it earns an info line: it tells the operator the
+        // daemon is stopping because a signal arrived, not because it crashed or self-terminated.
+        log::info!("received shutdown signal; stopping");
         reactor.request_shutdown();
     }
 }
