@@ -88,6 +88,43 @@ fn missing_required_family(family: AddressFamily, addrs: &InterfaceAddresses) ->
     }
 }
 
+/// Enforce that a bidirectional reflector can source every required family on BOTH interfaces.
+/// mDNS and SSDP re-emit on the source *and* the target, so a family required by `address_family`
+/// must be sendable on each: AND the two interfaces' addresses and run [`missing_required_family`]
+/// over the combined view, blaming the side that actually lacks the family (the source when it's
+/// the one missing it, otherwise the target).
+///
+/// # Errors
+/// [`BuildError::RequiredFamilyUnavailable`] naming the interface and the family it can't send.
+fn require_bidirectional_families(
+    dispatcher: &PacketDispatcher,
+    address_family: AddressFamily,
+    source: CaptureKey,
+    source_if: &str,
+    target: CaptureKey,
+    target_if: &str,
+) -> Result<(), BuildError> {
+    let src = dispatcher.egress_addrs(source).copied().unwrap_or_default();
+    let tgt = dispatcher.egress_addrs(target).copied().unwrap_or_default();
+    let both = InterfaceAddresses {
+        v4: src.v4.and(tgt.v4),
+        v6: src.v6.and(tgt.v6),
+        mac: tgt.mac, // unused by the family check
+    };
+    let Some(family) = missing_required_family(address_family, &both) else {
+        return Ok(());
+    };
+    let interface = match family {
+        IpFamily::V4 if src.v4.is_none() => source_if,
+        IpFamily::V6 if src.v6.is_none() => source_if,
+        _ => target_if,
+    };
+    Err(BuildError::RequiredFamilyUnavailable {
+        interface: interface.to_owned(),
+        family,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::Ipv4Addr;

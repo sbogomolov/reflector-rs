@@ -9,12 +9,11 @@ use std::net::SocketAddr;
 
 use crate::config::{AddressFamily, Reflector};
 use crate::dispatch::{CaptureKey, Filter, PacketDispatcher, PacketHandler};
-use crate::interface::InterfaceAddresses;
 use crate::net::mdns::{MDNS_GROUP_V4, MDNS_GROUP_V6, MDNS_PORT, MDNS_TTL, MdnsKind, classify};
 use crate::net::packet::Packet;
 use crate::reactor::Reactor;
 
-use super::{BuildError, InterfaceMap, IpFamily, egress_sources, missing_required_family};
+use super::{BuildError, InterfaceMap, egress_sources, require_bidirectional_families};
 
 /// A built mDNS reflector for one direction of one family: re-emits each message of its `kind` (query
 /// or response) captured on its ingress onto `egress`, to the message's own destination. The
@@ -103,25 +102,15 @@ pub(crate) fn build(
         .ok_or_else(|| BuildError::UnknownInterface(reflector.target_if.as_str().to_owned()))?;
 
     // Both interfaces re-emit (queries on target, responses on source), so a required family must
-    // be sendable on BOTH — feed missing_required_family an AND-combined view of their addresses.
-    let src = dispatcher.egress_addrs(source).copied().unwrap_or_default();
-    let tgt = dispatcher.egress_addrs(target).copied().unwrap_or_default();
-    let both = InterfaceAddresses {
-        v4: src.v4.and(tgt.v4),
-        v6: src.v6.and(tgt.v6),
-        mac: tgt.mac, // unused by the family check
-    };
-    if let Some(family) = missing_required_family(reflector.address_family, &both) {
-        let interface = match family {
-            IpFamily::V4 if src.v4.is_none() => &reflector.source_if,
-            IpFamily::V6 if src.v6.is_none() => &reflector.source_if,
-            _ => &reflector.target_if,
-        };
-        return Err(BuildError::RequiredFamilyUnavailable {
-            interface: interface.as_str().to_owned(),
-            family,
-        });
-    }
+    // be sendable on BOTH.
+    require_bidirectional_families(
+        dispatcher,
+        reflector.address_family,
+        source,
+        reflector.source_if.as_str(),
+        target,
+        reflector.target_if.as_str(),
+    )?;
 
     for group in used_groups(reflector.address_family) {
         let group_ip = group.ip();

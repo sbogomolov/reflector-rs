@@ -10,7 +10,6 @@ use std::time::{Duration, Instant};
 
 use crate::config::{AddressFamily, Reflector};
 use crate::dispatch::{CaptureKey, Filter, PacketDispatcher, PacketHandler, RegistrationKey};
-use crate::interface::InterfaceAddresses;
 use crate::net::mac::MacAddr;
 use crate::net::packet::Packet;
 use crate::net::port_reservation::PortReservation;
@@ -21,7 +20,7 @@ use crate::net::ssdp::{
 use crate::reactor::Reactor;
 
 use super::dial::{REWRITE_BUF_LEN, rewrite_location};
-use super::{BuildError, InterfaceMap, IpFamily, egress_sources, missing_required_family};
+use super::{BuildError, InterfaceMap, egress_sources, require_bidirectional_families};
 
 /// What a DIAL-enabled SSDP reflector needs to rewrite a device's `LOCATION` to a source-side proxy: the
 /// target capture the device sits behind (for its address) and that interface's egress-pin ifindex. The
@@ -474,26 +473,15 @@ pub(crate) fn build(
         .ok_or_else(|| BuildError::UnknownInterface(reflector.target_if.as_str().to_owned()))?;
 
     // The full reflector re-emits on both interfaces (advertisements on source, searches and their
-    // unicast responses on target), so a required family must be sendable on BOTH — feed
-    // missing_required_family an AND-combined view of their addresses.
-    let src = dispatcher.egress_addrs(source).copied().unwrap_or_default();
-    let tgt = dispatcher.egress_addrs(target).copied().unwrap_or_default();
-    let both = InterfaceAddresses {
-        v4: src.v4.and(tgt.v4),
-        v6: src.v6.and(tgt.v6),
-        mac: tgt.mac, // unused by the family check
-    };
-    if let Some(family) = missing_required_family(reflector.address_family, &both) {
-        let interface = match family {
-            IpFamily::V4 if src.v4.is_none() => &reflector.source_if,
-            IpFamily::V6 if src.v6.is_none() => &reflector.source_if,
-            _ => &reflector.target_if,
-        };
-        return Err(BuildError::RequiredFamilyUnavailable {
-            interface: interface.as_str().to_owned(),
-            family,
-        });
-    }
+    // unicast responses on target), so a required family must be sendable on BOTH.
+    require_bidirectional_families(
+        dispatcher,
+        reflector.address_family,
+        source,
+        reflector.source_if.as_str(),
+        target,
+        reflector.target_if.as_str(),
+    )?;
 
     // The reserved-port bind for an IPv6 link-local target source needs the target's scope id; use
     // the ifindex the capture already cached (the single source of truth the joiners bake too).
