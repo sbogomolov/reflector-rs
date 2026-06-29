@@ -31,16 +31,6 @@ pub(crate) struct InterfaceAddresses {
     pub(crate) v6: Option<Ipv6Addr>,
 }
 
-/// Which source fields a [`refresh`](Interface::refresh) found changed — one flag per
-/// [`InterfaceAddresses`] field, so a caller reacts only to the family it depends on (the DIAL proxies
-/// bind IPv4, so they re-mint only when `v4` moves, not on a routine v6 or MAC change).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct AddressChange {
-    pub(crate) mac: bool,
-    pub(crate) v4: bool,
-    pub(crate) v6: bool,
-}
-
 impl fmt::Display for InterfaceAddresses {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("mac ")?;
@@ -61,34 +51,14 @@ impl fmt::Display for InterfaceAddresses {
     }
 }
 
-/// The kernel ifindex of `name`, or `None` if it names no interface (a NUL in the name, or
-/// an unknown name). Address-change events report an ifindex; an [`Interface`] caches its
-/// own so a notification maps back to it.
-pub(crate) fn if_index(name: &str) -> Option<u32> {
-    let cname = std::ffi::CString::new(name).ok()?;
-    // SAFETY: `cname` is a valid NUL-terminated C string for the call's duration.
-    let index = unsafe { libc::if_nametoindex(cname.as_ptr()) };
-    (index != 0).then_some(index)
-}
-
-/// Log a single source field's transition at `info` — the address churn an operator (and the
-/// address-change e2e) wants visible — returning whether it changed at all, so the caller acts on
-/// exactly the families that moved. Nothing is logged when the field is unchanged.
-fn log_field_change<A: PartialEq + fmt::Display>(
-    iface: &str,
-    family: &str,
-    old: Option<A>,
-    new: Option<A>,
-) -> bool {
-    match (old, new) {
-        (None, Some(now)) => log::info!("interface {iface}: gained {family} {now}"),
-        (Some(was), None) => log::info!("interface {iface}: lost {family} (was {was})"),
-        (Some(was), Some(now)) if was != now => {
-            log::info!("interface {iface}: {family} changed {was} -> {now}");
-        }
-        _ => return false,
-    }
-    true
+/// Which source fields a [`refresh`](Interface::refresh) found changed — one flag per
+/// [`InterfaceAddresses`] field, so a caller reacts only to the family it depends on (the DIAL proxies
+/// bind IPv4, so they re-mint only when `v4` moves, not on a routine v6 or MAC change).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct AddressChange {
+    pub(crate) mac: bool,
+    pub(crate) v4: bool,
+    pub(crate) v6: bool,
 }
 
 /// One configured interface: its name (kept for re-resolution), kernel ifindex (the address
@@ -139,6 +109,36 @@ impl Interface {
         self.addrs = addrs;
         Ok(change)
     }
+}
+
+/// The kernel ifindex of `name`, or `None` if it names no interface (a NUL in the name, or
+/// an unknown name). Address-change events report an ifindex; an [`Interface`] caches its
+/// own so a notification maps back to it.
+pub(crate) fn if_index(name: &str) -> Option<u32> {
+    let cname = std::ffi::CString::new(name).ok()?;
+    // SAFETY: `cname` is a valid NUL-terminated C string for the call's duration.
+    let index = unsafe { libc::if_nametoindex(cname.as_ptr()) };
+    (index != 0).then_some(index)
+}
+
+/// Log a single source field's transition at `info` — the address churn an operator (and the
+/// address-change e2e) wants visible — returning whether it changed at all, so the caller acts on
+/// exactly the families that moved. Nothing is logged when the field is unchanged.
+fn log_field_change<A: PartialEq + fmt::Display>(
+    iface: &str,
+    family: &str,
+    old: Option<A>,
+    new: Option<A>,
+) -> bool {
+    match (old, new) {
+        (None, Some(now)) => log::info!("interface {iface}: gained {family} {now}"),
+        (Some(was), None) => log::info!("interface {iface}: lost {family} (was {was})"),
+        (Some(was), Some(now)) if was != now => {
+            log::info!("interface {iface}: {family} changed {was} -> {now}");
+        }
+        _ => return false,
+    }
+    true
 }
 
 /// Rank an IPv6 source candidate: link-local > ULA > global > other. The reflector reflects
