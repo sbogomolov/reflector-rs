@@ -286,7 +286,10 @@ fn scan_addr(
         return;
     };
     if family == libc::AF_INET {
+        // First usable address wins: skip a tentative/deprecated/secondary v4 (the same
+        // IFA_F_UNUSABLE mask the v6 branch applies) so it is never chosen as the reflection source.
         if addrs.v4.is_none()
+            && flags & IFA_F_UNUSABLE == 0
             && let Ok(octets) = <[u8; 4]>::try_from(bytes)
         {
             let v4 = Ipv4Addr::from(octets);
