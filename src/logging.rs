@@ -24,39 +24,6 @@ struct StderrLogger;
 
 static LOGGER: StderrLogger = StderrLogger;
 
-/// Install the global logger backend with the default severity threshold.
-///
-/// Installing a process-global logger is the binary's responsibility, not a
-/// library's, so this is called once from `main`; [`set_level`] then applies the
-/// configured threshold once the configuration has been loaded.
-///
-/// # Panics
-/// Panics if called more than once in the process — a second call would try to
-/// replace the already-installed global logger.
-pub fn init() {
-    log::set_logger(&LOGGER).expect("logging::init called more than once");
-    log::set_max_level(LevelFilter::from(LogLevel::default()));
-}
-
-/// Set the minimum severity that will be logged. Cheap and idempotent — the
-/// library calls this once the configured level is known.
-pub(crate) fn set_level(level: LogLevel) {
-    log::set_max_level(LevelFilter::from(level));
-}
-
-impl From<LogLevel> for LevelFilter {
-    fn from(level: LogLevel) -> Self {
-        match level {
-            LogLevel::Off => LevelFilter::Off,
-            LogLevel::Error => LevelFilter::Error,
-            LogLevel::Warning => LevelFilter::Warn,
-            LogLevel::Info => LevelFilter::Info,
-            LogLevel::Debug => LevelFilter::Debug,
-            LogLevel::Trace => LevelFilter::Trace,
-        }
-    }
-}
-
 impl Log for StderrLogger {
     fn enabled(&self, metadata: &Metadata) -> bool {
         metadata.level() <= log::max_level()
@@ -142,6 +109,39 @@ impl fmt::Display for Utc {
             "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
             self.year, self.month, self.day, self.hour, self.minute, self.second,
         )
+    }
+}
+
+/// Install the global logger backend with the default severity threshold.
+///
+/// Installing a process-global logger is the binary's responsibility, not a
+/// library's, so this is called once from `main`; [`set_level`] then applies the
+/// configured threshold once the configuration has been loaded.
+///
+/// # Panics
+/// Panics if called more than once in the process — a second call would try to
+/// replace the already-installed global logger.
+pub fn init() {
+    log::set_logger(&LOGGER).expect("logging::init called more than once");
+    log::set_max_level(LevelFilter::from(LogLevel::default()));
+}
+
+/// Set the minimum severity that will be logged. Cheap and idempotent — the
+/// library calls this once the configured level is known.
+pub(crate) fn set_level(level: LogLevel) {
+    log::set_max_level(LevelFilter::from(level));
+}
+
+impl From<LogLevel> for LevelFilter {
+    fn from(level: LogLevel) -> Self {
+        match level {
+            LogLevel::Off => LevelFilter::Off,
+            LogLevel::Error => LevelFilter::Error,
+            LogLevel::Warning => LevelFilter::Warn,
+            LogLevel::Info => LevelFilter::Info,
+            LogLevel::Debug => LevelFilter::Debug,
+            LogLevel::Trace => LevelFilter::Trace,
+        }
     }
 }
 
