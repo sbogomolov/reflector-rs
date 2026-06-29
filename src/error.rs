@@ -1,7 +1,7 @@
 //! The crate-wide error type.
 //!
 //! Every fallible operation returns [`Result<T>`] and `?` propagates failures up
-//! to [`crate::run`]. [`Error`] is opaque: `main` prints its `Display` text to
+//! to [`crate::run`]. [`struct@Error`] is opaque: `main` prints its `Display` text to
 //! stderr, and tests assert on the subsystems' structured errors directly rather
 //! than reaching through it.
 
@@ -25,7 +25,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Debug)]
 pub struct Error(ErrorKind);
 
-/// The private cause behind an [`Error`]: one variant per subsystem, each
+/// The private cause behind an [`struct@Error`]: one variant per subsystem, each
 /// wrapping that subsystem's error with `#[from]`.
 #[derive(Debug, Error)]
 enum ErrorKind {

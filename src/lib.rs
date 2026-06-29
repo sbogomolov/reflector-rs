@@ -27,7 +27,7 @@ use self::reflector::InterfaceMap;
 
 /// Run the reflector to completion.
 ///
-/// `args` is the process argument list with argv[0] already stripped. The first
+/// `args` is the process argument list with `argv[0]` already stripped. The first
 /// argument, if present, is a TOML config path; `REFLECTOR_*` environment
 /// variables are merged on top (and can configure reflectors on their own).
 ///

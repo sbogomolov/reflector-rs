@@ -115,7 +115,7 @@ impl fmt::Display for Utc {
 /// Install the global logger backend with the default severity threshold.
 ///
 /// Installing a process-global logger is the binary's responsibility, not a
-/// library's, so this is called once from `main`; [`set_level`] then applies the
+/// library's, so this is called once from `main`; `set_level` then applies the
 /// configured threshold once the configuration has been loaded.
 ///
 /// # Panics
