@@ -78,7 +78,10 @@ impl FromStr for MacAddr {
         let mut parts = s.split(':');
         for slot in &mut bytes {
             let part = parts.next().ok_or(ParseMacAddrError)?;
-            if part.len() != 2 {
+            // Exactly two hex digits. The is_ascii_hexdigit guard is load-bearing: u8::from_str_radix
+            // accepts a leading '+' (e.g. "+a" parses to 10), so the length check alone would admit a
+            // malformed octet like "+a:+b:+c:+d:+e:+f".
+            if part.len() != 2 || !part.bytes().all(|b| b.is_ascii_hexdigit()) {
                 return Err(ParseMacAddrError);
             }
             *slot = u8::from_str_radix(part, 16).map_err(|_| ParseMacAddrError)?;
@@ -112,6 +115,16 @@ mod tests {
         assert_eq!(upper, mixed);
         assert_eq!(upper.to_string(), "b0:37:95:c5:60:be");
         assert_eq!("zz".parse::<MacAddr>(), Err(ParseMacAddrError));
+    }
+
+    #[test]
+    fn mac_rejects_sign_prefixed_octets() {
+        // u8::from_str_radix accepts a leading '+', so without an explicit hex-digit guard each "+x"
+        // octet would parse and a fully sign-prefixed MAC would be admitted. It must be rejected.
+        assert_eq!(
+            "+a:+b:+c:+d:+e:+f".parse::<MacAddr>(),
+            Err(ParseMacAddrError)
+        );
     }
 
     #[test]
