@@ -1,0 +1,9 @@
+log_level = "debug"
+
+# A single DIAL entry, so the reflector's SSDP relay carries the device's 200 OK exactly once (the shared
+# config.toml's any-MAC [reflectors.discovery] entry would otherwise double-reflect it). DIAL requires ssdp.
+[reflectors.dial-tv]
+source_if = "wol_src"
+target_if = "wol_dst"
+ssdp = true
+dial = true

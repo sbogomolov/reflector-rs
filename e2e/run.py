@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import dataclasses
 import shutil
 import subprocess
@@ -88,6 +89,18 @@ SSDP_OK_HEX = (
     "LOCATION: http://device.invalid/desc.xml\r\n\r\n"
 ).encode().hex()
 SEARCHER_SOURCE_PORT = 49152
+
+# DIAL discovery: a DIAL-targeted M-SEARCH (ST is the DIAL service type). The emulator answers it with a
+# 200 OK whose LOCATION points at its own target-side HTTP description endpoint.
+DIAL_SERVICE_TYPE = "urn:dial-multiscreen-org:service:dial:1"
+SSDP_DIAL_MSEARCH_HEX = (
+    "M-SEARCH * HTTP/1.1\r\n"
+    "HOST: 239.255.255.250:1900\r\n"
+    'MAN: "ssdp:discover"\r\n'
+    "MX: 2\r\n"
+    f"ST: {DIAL_SERVICE_TYPE}\r\n\r\n"
+).encode().hex()
+DIAL_CLIENT_SOURCE_PORT = 49153
 # --- Address-change cases: knock out one (interface, family) source on the reflector, prove
 # reflection of that family stops, then restore it and prove it resumes. The reflector reacts on
 # its own event loop after the netlink notification, so each check polls across that async window.
@@ -410,6 +423,23 @@ ROUNDTRIP_CASES = [
         timeout_seconds=2.0, expect_reply=False),
 ]
 
+@dataclasses.dataclass(frozen=True)
+class DialCase:
+    name: str
+    family: int          # 4 (DIAL is IPv4-only by spec; kept as a field for symmetry)
+    group: str
+    timeout_seconds: float = 8.0
+    serve_seconds: float = 6.0
+    passive: bool = False      # passive discovery (device advertises NOTIFY; client listens) vs active M-SEARCH
+    unreachable: bool = False  # device advertises a dead HTTP port; the proxied fetch must fail, not hang
+
+
+DIAL_CASES = [
+    DialCase(name="dial_launch_roundtrip", family=4, group=SSDP_GROUP_V4),
+    DialCase(name="dial_passive_notify_roundtrip", family=4, group=SSDP_GROUP_V4, passive=True),
+    DialCase(name="dial_upstream_unreachable", family=4, group=SSDP_GROUP_V4, unreachable=True),
+]
+
 # Per-protocol probe parameters for the address-change phases: wol sends a magic packet (no payload
 # or group); mdns sends a query to its family's group, relayed verbatim.
 PROBE_SPECS = {
@@ -456,8 +486,8 @@ ADDRESS_CHANGE_CASES = [
     ),
 ]
 
-ALL_CASES: list[TestCase | RoundTripCase | AddressChangeCase] = [
-    *TEST_CASES, *MDNS_CASES, *SSDP_CASES, *ROUNDTRIP_CASES, *ADDRESS_CHANGE_CASES]
+ALL_CASES: list[TestCase | RoundTripCase | DialCase | AddressChangeCase] = [
+    *TEST_CASES, *MDNS_CASES, *SSDP_CASES, *ROUNDTRIP_CASES, *DIAL_CASES, *ADDRESS_CHANGE_CASES]
 
 
 def format_command(command: list[str]) -> str:
@@ -807,6 +837,145 @@ class DockerRoundTrip(DockerE2E):
             self.print_reflector_logs()
 
 
+class DockerDial(DockerE2E):
+    def __init__(self, args: argparse.Namespace, case: DialCase) -> None:
+        shim = TestCase(name=case.name, send_port=SSDP_PORT, receive_port=SSDP_PORT,
+            expect_mac=None, timeout_seconds=case.timeout_seconds, family=case.family,
+            group=case.group, direction="forward")
+        super().__init__(args, shim)
+        self.dial = case
+        # The DIAL reflector loads a config with a single DIAL entry. The shared config's any-MAC
+        # [reflectors.discovery] entry also reflects SSDP, which would double-reflect the device's 200 OK
+        # (only one copy rewritten) -- so the DIAL case gets its own config to keep the relayed reply unambiguous.
+        self.config_path = E2E_DIR / "config-dial.toml"
+        self.device_container = f"{self.prefix}-device"
+        self.client_container = f"{self.prefix}-client"
+        self.containers = [self.client_container, self.device_container, self.reflector_container]
+
+    def container_ip(self, container: str, network: str) -> str:
+        fmt = '{{(index .NetworkSettings.Networks "' + network + '").IPAddress}}'
+        ip = docker(["inspect", "-f", fmt, container]).stdout.strip()
+        if not ip:
+            raise RuntimeError(f"no IPv4 address for {container} on {network}")
+        return ip
+
+    def start_device(self) -> None:
+        # Single-homed on the target network: the device's HTTP endpoints are reachable only via the
+        # reflector's egress-pinned upstream connect, so the peer it records is the reflector's target_if
+        # address -- never the source-side client (which cannot route to the target subnet directly).
+        cmd = [
+            "run", "-d", "--name", self.device_container,
+            "--network", f"name={self.target_network},driver-opt=com.docker.network.endpoint.ifname={RECEIVER_IFNAME}",
+            "--mount", f"type=bind,source={E2E_DIR},target=/e2e,readonly",
+            self.args.helper_image, "python3", "/e2e/probe.py", "dial-device",
+            "--port", str(SSDP_PORT), "--join-group", self.dial.group,
+            "--interface", RECEIVER_IFNAME, "--family", str(self.dial.family),
+            "--timeout", str(self.dial.timeout_seconds), "--serve-seconds", str(self.dial.serve_seconds),
+        ]
+        if self.dial.passive:
+            cmd.append("--notify")
+        if self.dial.unreachable:
+            cmd.append("--unreachable")
+        docker(cmd)
+        self.wait_for_container_log(self.device_container, "dial-device ready", "dial-device")
+
+    def run_client(self) -> None:
+        # The client is single-homed on the source network. It is told the reflector's source_if address
+        # (what the rewritten authorities must point at) and the device's true target_if address (which
+        # must never leak through a rewrite). Both are read after the containers attached to their nets.
+        device_target_ip = self.container_ip(self.device_container, self.target_network)
+        refl_source_ip = self.container_ip(self.reflector_container, self.source_network)
+        cmd = [
+            "run", "-d", "--name", self.client_container,
+            "--network", f"name={self.source_network},driver-opt=com.docker.network.endpoint.ifname={REFLECTOR_SOURCE_IFNAME}",
+            "--mount", f"type=bind,source={E2E_DIR},target=/e2e,readonly",
+            self.args.helper_image, "python3", "/e2e/probe.py", "dial-client",
+            "--port", str(SSDP_PORT), "--address", self.dial.group, "--interface", REFLECTOR_SOURCE_IFNAME,
+            "--family", str(self.dial.family), "--timeout", str(self.dial.timeout_seconds),
+            "--reflector-authority", refl_source_ip, "--device-authority", device_target_ip,
+        ]
+        if self.dial.passive:
+            cmd.append("--passive")  # listen for the relayed NOTIFY instead of sending an M-SEARCH
+        else:
+            cmd += ["--source-port", str(DIAL_CLIENT_SOURCE_PORT), "--payload-hex", SSDP_DIAL_MSEARCH_HEX]
+        if self.dial.unreachable:
+            cmd.append("--expect-fetch-failure")  # the device's upstream is dead; the fetch must fail
+        docker(cmd)
+
+    def wait_for_client(self) -> None:
+        exit_code = docker(["wait", self.client_container]).stdout.strip()
+        logs = docker(["logs", self.client_container], check=False)
+        if logs.stdout:
+            print(logs.stdout, end="", flush=True)
+        if logs.stderr:
+            print(logs.stderr, end="", file=sys.stderr, flush=True)
+        if exit_code != "0":
+            raise RuntimeError(f"dial-client failed with exit code {exit_code}")
+
+    def assert_device_verdicts(self) -> None:
+        # Two device-side checks: (1) the device exits non-zero if any request reached it with a Host that
+        # was not rewritten to its own authority (the reflector must rewrite Host source->device); (2) the
+        # reflector's upstream connect is egress-pinned to target_if, so the only peer the device recorded
+        # must be exactly the reflector's target_if address.
+        refl_target_ip = self.container_ip(self.reflector_container, self.target_network)
+        exit_code = docker(["wait", self.device_container]).stdout.strip()
+        logs = docker(["logs", self.device_container], check=False)
+        if logs.stdout:
+            print(logs.stdout, end="", flush=True)
+        if logs.stderr:
+            print(logs.stderr, end="", file=sys.stderr, flush=True)
+        if exit_code != "0":
+            raise RuntimeError(f"dial-device failed with exit code {exit_code} "
+                               f"(a request reached it with an unrewritten Host)")
+        marker = "dial-device upstream peers seen: "
+        line = next((ln for ln in logs.stdout.splitlines() if marker in ln), None)
+        if line is None:
+            raise RuntimeError("dial-device did not report the upstream peers it saw")
+        seen = ast.literal_eval(line.split(marker, 1)[1].strip())
+        if seen != [refl_target_ip]:
+            raise RuntimeError(f"device saw upstream peers {seen}, expected only the reflector's target_if "
+                               f"address [{refl_target_ip!r}] (egress not pinned to target_if)")
+        print(f"dial: every request's Host was rewritten to the device, and every upstream connection came "
+              f"from the reflector's target_if address {refl_target_ip}", flush=True)
+
+    def _force_upstream_egress_ambiguity(self) -> None:
+        # Make the upstream egress pin load-bearing. The device is single-homed on the target net, so the
+        # reflector's connect reaches it via target_if by routing alone, and SO_BINDTODEVICE (TcpSocket
+        # PinEgress) would be untestable — assert_device_verdicts' "peer == reflector target_if address"
+        # passes even if the pin were dropped. Plant a more-specific host route to the device via the WRONG
+        # interface (source_if): an unpinned connect now follows it, ARPs the device on the source segment
+        # (where it does not live) and fails, so the whole DIAL flow breaks. Only the egress pin — which
+        # constrains the route lookup to target_if — still reaches the device, so PASS now requires it.
+        device_ip = self.container_ip(self.device_container, self.target_network)
+        docker([
+            "run", "--rm", "--privileged", "--network", f"container:{self.reflector_container}",
+            self.args.helper_image, "ip", "route", "add", f"{device_ip}/32", "dev", REFLECTOR_SOURCE_IFNAME,
+        ])
+
+    def run(self) -> None:
+        print(f"\n=== {self.dial.name} ===", flush=True)
+        self.setup_networks()
+        self.start_reflector()
+        self.start_device()      # must be serving before the client searches
+        if not self.dial.unreachable:
+            # The unreachable case asserts a PROMPT connect failure; a decoy route would change the
+            # failure mode (ARP timeout vs refused), so only arm the ambiguity where we assert success.
+            self._force_upstream_egress_ambiguity()
+        self.run_client()
+        self.wait_for_client()        # client-side verdict: rewrites (or, for unreachable, the expected fail)
+        if self.dial.unreachable:
+            docker(["wait", self.device_container])  # no HTTP server in this mode: nothing to assert
+            logs = docker(["logs", self.device_container], check=False)
+            if logs.stdout:
+                print(logs.stdout, end="", flush=True)
+        else:
+            self.assert_device_verdicts()  # device-side verdict: Host rewrite + egress-pinned upstream
+        print(f"PASS {self.dial.name}", flush=True)
+        if self.args.show_reflector_logs:
+            time.sleep(0.5)
+            self.print_reflector_logs()
+
+
 class DockerAddressChange(DockerE2E):
     # Proves the dynamic family bring-up/teardown end to end: with a dual-family reflector running,
     # knock out one (interface, family) source address at a time and verify -- with real traffic, not
@@ -983,9 +1152,11 @@ class DockerAddressChange(DockerE2E):
 
 
 def make_runner(args: argparse.Namespace,
-        case: TestCase | RoundTripCase | AddressChangeCase) -> DockerE2E:
+        case: TestCase | RoundTripCase | DialCase | AddressChangeCase) -> DockerE2E:
     if isinstance(case, RoundTripCase):
         return DockerRoundTrip(args, case)
+    if isinstance(case, DialCase):
+        return DockerDial(args, case)
     if isinstance(case, AddressChangeCase):
         return DockerAddressChange(args, case)
     return DockerE2E(args, case)
@@ -995,7 +1166,7 @@ def build_reflector_image(image: str) -> None:
     docker(["build", "-t", image, "."], capture=False)
 
 
-def select_cases(case_names: list[str]) -> list[TestCase | RoundTripCase | AddressChangeCase]:
+def select_cases(case_names: list[str]) -> list[TestCase | RoundTripCase | DialCase | AddressChangeCase]:
     if not case_names:
         return ALL_CASES
 
