@@ -440,6 +440,28 @@ DIAL_CASES = [
     DialCase(name="dial_upstream_unreachable", family=4, group=SSDP_GROUP_V4, unreachable=True),
 ]
 
+
+@dataclasses.dataclass(frozen=True)
+class DialAddressChangeCase:
+    # A full DIAL pass, then the same pass again after the reflector's source IPv4 changes, then again
+    # after its target IPv4 changes -- to a *different* address each time. A passing re-run is the 7d
+    # proof: a proxy not evicted on the change would re-advertise a LOCATION on the vanished source
+    # address (the fetch can't reach it) or bind the vanished target on its upstream connect. The device
+    # advertises NOTIFY throughout (passive discovery), so each phase's fresh client rediscovers and the
+    # reflector re-mints against the current addresses.
+    name: str
+    family: int = 4
+    group: str = SSDP_GROUP_V4
+    timeout_seconds: float = 8.0
+    serve_seconds: float = 60.0  # device keeps advertising + serving across all three passes
+    passive: bool = True
+    unreachable: bool = False
+
+
+DIAL_ADDRESS_CHANGE_CASES = [
+    DialAddressChangeCase(name="dial_address_change"),
+]
+
 # Per-protocol probe parameters for the address-change phases: wol sends a magic packet (no payload
 # or group); mdns sends a query to its family's group, relayed verbatim.
 PROBE_SPECS = {
@@ -486,8 +508,9 @@ ADDRESS_CHANGE_CASES = [
     ),
 ]
 
-ALL_CASES: list[TestCase | RoundTripCase | DialCase | AddressChangeCase] = [
-    *TEST_CASES, *MDNS_CASES, *SSDP_CASES, *ROUNDTRIP_CASES, *DIAL_CASES, *ADDRESS_CHANGE_CASES]
+ALL_CASES: list[TestCase | RoundTripCase | DialCase | DialAddressChangeCase | AddressChangeCase] = [
+    *TEST_CASES, *MDNS_CASES, *SSDP_CASES, *ROUNDTRIP_CASES, *DIAL_CASES, *DIAL_ADDRESS_CHANGE_CASES,
+    *ADDRESS_CHANGE_CASES]
 
 
 def format_command(command: list[str]) -> str:
@@ -730,6 +753,41 @@ class DockerE2E:
             print(logs.stderr, end="", file=sys.stderr, flush=True)
         if not logs.stdout and not logs.stderr:
             print("<empty>", flush=True)
+
+    def _sidecar(self, script: str, *, capture: bool = False) -> str:
+        # Address changes need CAP_NET_ADMIN and a writable /proc/sys, which the reflector container
+        # (scratch image, NET_RAW only) has by neither. Run a throwaway privileged container in the
+        # reflector's network namespace, so `ip addr` / the disable_ipv6 sysctl act on the very
+        # interfaces the reflector watches -- without widening the reflector's own privileges.
+        result = docker([
+            "run", "--rm", "--privileged", "--network", f"container:{self.reflector_container}",
+            self.args.helper_image, "sh", "-ec", script,
+        ])
+        return result.stdout.strip() if capture else ""
+
+    def _set_address(
+        self, interface: str, family: int, *, up: bool, cidr: str | None = None
+    ) -> str | None:
+        # Bring one (interface, family) source address down or back up. IPv6 toggles the disable_ipv6
+        # sysctl (which drops every v6 address and, on re-enable, lets the kernel regenerate a usable
+        # link-local); v4 has no equivalent, so it deletes and later re-adds the exact CIDR. Returns
+        # the removed v4 CIDR so the caller can restore it.
+        ifname = REFLECTOR_SOURCE_IFNAME if interface == "source" else REFLECTOR_TARGET_IFNAME
+        if family == 6:
+            self._sidecar(f"echo {0 if up else 1} > /proc/sys/net/ipv6/conf/{ifname}/disable_ipv6")
+            return None
+        if up:
+            if cidr is None:
+                raise RuntimeError("restoring an IPv4 address requires the CIDR captured on removal")
+            self._sidecar(f"ip addr add {cidr} dev {ifname}")
+            return cidr
+        captured = self._sidecar(
+            f"ip -o -4 addr show dev {ifname} | awk '/inet /{{print $4; exit}}'", capture=True
+        )
+        if not captured:
+            raise RuntimeError(f"no IPv4 address on {ifname} to remove")
+        self._sidecar(f"ip addr del {captured} dev {ifname}")
+        return captured
 
     def print_diagnostics(self) -> None:
         print(f"\n--- diagnostics for {self.case.name} ({self.prefix}) ---", file=sys.stderr, flush=True)
@@ -976,6 +1034,80 @@ class DockerDial(DockerE2E):
             self.print_reflector_logs()
 
 
+class DockerDialAddressChange(DockerDial):
+    # A DIAL pass, then the same pass after the reflector's source IPv4 changes, then after its target
+    # IPv4 changes -- each to a different same-subnet address. The device stays up (passive NOTIFY +
+    # HTTP) across all three; a fresh client runs each pass. _set_address (base) does the change via the
+    # privileged sidecar in the reflector's netns; the reflector reacts on its own event loop, so each
+    # change waits for the "gained IPv4 <new>" log before the next pass.
+    def _different_cidr(self, cidr: str) -> str:
+        # A different host on the same subnet: Docker hands out low addresses (.2, .3, ...), so .222 is
+        # free (and .221 if the interface somehow already holds .222).
+        host, prefix = cidr.split("/")
+        octets = host.split(".")
+        octets[-1] = "222" if octets[-1] != "222" else "221"
+        return f"{'.'.join(octets)}/{prefix}"
+
+    def _change_v4(self, interface: str) -> str:
+        # Replace the reflector's IPv4 on `interface` with a different same-subnet address, then wait for
+        # the reflector to observe it -- which is when 7d evicts the now-stale proxy. Returns the new host.
+        old_cidr = self._set_address(interface, 4, up=False)        # del old, capture its CIDR
+        new_cidr = self._different_cidr(old_cidr)
+        self._set_address(interface, 4, up=True, cidr=new_cidr)     # add the different one
+        new_host = new_cidr.split("/")[0]
+        print(f"{self.dial.name}: {interface} IPv4 {old_cidr} -> {new_cidr}", flush=True)
+        self.wait_for_container_log(
+            self.reflector_container, f"gained IPv4 {new_host}", f"{interface} IPv4 change"
+        )
+        return new_host
+
+    def _dial_pass(self, label: str, reflector_authority: str, device_authority: str) -> None:
+        # One full DIAL flow through the reflector from a fresh client, asserting every rewrite points at
+        # `reflector_authority` (the reflector's CURRENT source IPv4) and never leaks `device_authority`.
+        container = f"{self.client_container}-{label.replace(' ', '-')}"
+        self.containers.insert(0, container)  # cleaned up by the base teardown
+        docker([
+            "run", "-d", "--name", container,
+            "--network", f"name={self.source_network},driver-opt=com.docker.network.endpoint.ifname={REFLECTOR_SOURCE_IFNAME}",
+            "--mount", f"type=bind,source={E2E_DIR},target=/e2e,readonly",
+            self.args.helper_image, "python3", "/e2e/probe.py", "dial-client",
+            "--port", str(SSDP_PORT), "--address", self.dial.group, "--interface", REFLECTOR_SOURCE_IFNAME,
+            "--family", str(self.dial.family), "--timeout", str(self.dial.timeout_seconds),
+            "--reflector-authority", reflector_authority, "--device-authority", device_authority,
+            "--passive",
+        ])
+        exit_code = docker(["wait", container]).stdout.strip()
+        logs = docker(["logs", container], check=False)
+        if logs.stdout:
+            print(logs.stdout, end="", flush=True)
+        if logs.stderr:
+            print(logs.stderr, end="", file=sys.stderr, flush=True)
+        if exit_code != "0":
+            raise RuntimeError(f"{self.dial.name}: DIAL pass '{label}' failed with exit code {exit_code}")
+        print(f"{self.dial.name}: DIAL pass '{label}' succeeded (rewrites -> {reflector_authority})", flush=True)
+
+    def run(self) -> None:
+        print(f"\n=== {self.dial.name} ===", flush=True)
+        self.setup_networks()
+        self.start_reflector()
+        self.start_device()  # passive: advertises NOTIFY + serves HTTP for serve_seconds
+        device_ip = self.container_ip(self.device_container, self.target_network)
+        source_ip = self.container_ip(self.reflector_container, self.source_network)
+
+        # Baseline, then re-run after each interface's IPv4 moves to a different address. A passing
+        # re-run requires 7d to have evicted the proxy bound to the vanished address.
+        self._dial_pass("baseline", source_ip, device_ip)
+        source_ip = self._change_v4("source")
+        self._dial_pass("after source IPv4 change", source_ip, device_ip)
+        self._change_v4("target")  # the source authority is unchanged by a target move
+        self._dial_pass("after target IPv4 change", source_ip, device_ip)
+
+        print(f"PASS {self.dial.name}", flush=True)
+        if self.args.show_reflector_logs:
+            time.sleep(0.5)
+            self.print_reflector_logs()
+
+
 class DockerAddressChange(DockerE2E):
     # Proves the dynamic family bring-up/teardown end to end: with a dual-family reflector running,
     # knock out one (interface, family) source address at a time and verify -- with real traffic, not
@@ -1055,41 +1187,6 @@ class DockerAddressChange(DockerE2E):
                 consecutive = 0
         return False
 
-    def _sidecar(self, script: str, *, capture: bool = False) -> str:
-        # Address changes need CAP_NET_ADMIN and a writable /proc/sys, which the reflector container
-        # (scratch image, NET_RAW only) has by neither. Run a throwaway privileged container in the
-        # reflector's network namespace, so `ip addr` / the disable_ipv6 sysctl act on the very
-        # interfaces the reflector watches -- without widening the reflector's own privileges.
-        result = docker([
-            "run", "--rm", "--privileged", "--network", f"container:{self.reflector_container}",
-            self.args.helper_image, "sh", "-ec", script,
-        ])
-        return result.stdout.strip() if capture else ""
-
-    def _set_address(
-        self, interface: str, family: int, *, up: bool, cidr: str | None = None
-    ) -> str | None:
-        # Bring one (interface, family) source address down or back up. IPv6 toggles the disable_ipv6
-        # sysctl (which drops every v6 address and, on re-enable, lets the kernel regenerate a usable
-        # link-local); v4 has no equivalent, so it deletes and later re-adds the exact CIDR. Returns
-        # the removed v4 CIDR so the caller can restore it.
-        ifname = REFLECTOR_SOURCE_IFNAME if interface == "source" else REFLECTOR_TARGET_IFNAME
-        if family == 6:
-            self._sidecar(f"echo {0 if up else 1} > /proc/sys/net/ipv6/conf/{ifname}/disable_ipv6")
-            return None
-        if up:
-            if cidr is None:
-                raise RuntimeError("restoring an IPv4 address requires the CIDR captured on removal")
-            self._sidecar(f"ip addr add {cidr} dev {ifname}")
-            return cidr
-        captured = self._sidecar(
-            f"ip -o -4 addr show dev {ifname} | awk '/inet /{{print $4; exit}}'", capture=True
-        )
-        if not captured:
-            raise RuntimeError(f"no IPv4 address on {ifname} to remove")
-        self._sidecar(f"ip addr del {captured} dev {ifname}")
-        return captured
-
     def _run_phase(self, phase: Phase) -> None:
         desc = f"{self.ac.name} / {phase.label}"
         print(f"--- phase: {desc} ({phase.protocol} IPv{phase.family}) ---", flush=True)
@@ -1152,9 +1249,11 @@ class DockerAddressChange(DockerE2E):
 
 
 def make_runner(args: argparse.Namespace,
-        case: TestCase | RoundTripCase | DialCase | AddressChangeCase) -> DockerE2E:
+        case: TestCase | RoundTripCase | DialCase | DialAddressChangeCase | AddressChangeCase) -> DockerE2E:
     if isinstance(case, RoundTripCase):
         return DockerRoundTrip(args, case)
+    if isinstance(case, DialAddressChangeCase):
+        return DockerDialAddressChange(args, case)
     if isinstance(case, DialCase):
         return DockerDial(args, case)
     if isinstance(case, AddressChangeCase):
@@ -1166,7 +1265,7 @@ def build_reflector_image(image: str) -> None:
     docker(["build", "-t", image, "."], capture=False)
 
 
-def select_cases(case_names: list[str]) -> list[TestCase | RoundTripCase | DialCase | AddressChangeCase]:
+def select_cases(case_names: list[str]) -> list[TestCase | RoundTripCase | DialCase | DialAddressChangeCase | AddressChangeCase]:
     if not case_names:
         return ALL_CASES
 
