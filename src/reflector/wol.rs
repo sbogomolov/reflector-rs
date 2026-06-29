@@ -29,30 +29,6 @@ const MAGIC_LEN: usize = PREFIX_LEN + MAC_REPS * MAC_LEN;
 /// equivalent of the IPv4 limited broadcast a magic packet re-emits to.
 const V6_ALL_NODES: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1);
 
-/// Whether `payload` opens with a Wake-on-LAN magic packet for an acceptable target: the
-/// `6×0xFF` prefix followed by one MAC repeated 16 times. Trailing bytes (a `SecureOn` password)
-/// are ignored — only the leading [`MAGIC_LEN`] are inspected — and the caller forwards them
-/// as-is. When `target_mac` is set, the repeated MAC must equal it, so only that one device's
-/// wakes are reflected.
-fn is_magic_packet(payload: &[u8], target_mac: Option<MacAddr>) -> bool {
-    let Some(magic) = payload.get(..MAGIC_LEN) else {
-        return false;
-    };
-    if magic[..PREFIX_LEN] != [0xff; PREFIX_LEN] {
-        return false;
-    }
-    let mac = &magic[PREFIX_LEN..PREFIX_LEN + MAC_LEN];
-    // The other 15 repetitions must all equal the first.
-    if !magic[PREFIX_LEN + MAC_LEN..]
-        .chunks_exact(MAC_LEN)
-        .all(|rep| rep == mac)
-    {
-        return false;
-    }
-    // A configured target narrows the reflector to that device's wake.
-    target_mac.is_none_or(|target| mac == target.octets())
-}
-
 /// A built Wake-on-LAN reflector: re-emits each validated magic packet on its `egress` interface.
 /// One is registered per configured port.
 struct WolReflector {
@@ -104,6 +80,30 @@ impl PacketHandler for WolReflector {
             ),
         }
     }
+}
+
+/// Whether `payload` opens with a Wake-on-LAN magic packet for an acceptable target: the
+/// `6×0xFF` prefix followed by one MAC repeated 16 times. Trailing bytes (a `SecureOn` password)
+/// are ignored — only the leading [`MAGIC_LEN`] are inspected — and the caller forwards them
+/// as-is. When `target_mac` is set, the repeated MAC must equal it, so only that one device's
+/// wakes are reflected.
+fn is_magic_packet(payload: &[u8], target_mac: Option<MacAddr>) -> bool {
+    let Some(magic) = payload.get(..MAGIC_LEN) else {
+        return false;
+    };
+    if magic[..PREFIX_LEN] != [0xff; PREFIX_LEN] {
+        return false;
+    }
+    let mac = &magic[PREFIX_LEN..PREFIX_LEN + MAC_LEN];
+    // The other 15 repetitions must all equal the first.
+    if !magic[PREFIX_LEN + MAC_LEN..]
+        .chunks_exact(MAC_LEN)
+        .all(|rep| rep == mac)
+    {
+        return false;
+    }
+    // A configured target narrows the reflector to that device's wake.
+    target_mac.is_none_or(|target| mac == target.octets())
 }
 
 /// The link-wide destination a magic packet captured as `packet` re-emits to under `family`: the
