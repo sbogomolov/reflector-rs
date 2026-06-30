@@ -13,6 +13,7 @@ use std::net::SocketAddr;
 
 use crate::config::{AddressFamily, Reflector};
 use crate::dispatch::{CaptureKey, Filter, PacketDispatcher};
+use crate::interface::InterfaceAddresses;
 use crate::net::ssdp::{
     SSDP_GROUP_V4, SSDP_GROUP_V6_LINK_LOCAL, SSDP_GROUP_V6_SITE_LOCAL, SSDP_PORT,
 };
@@ -48,8 +49,12 @@ fn dial_rewrite<'a>(
         return payload;
     };
     let (Some(source), Some(target)) = (
-        dispatcher.egress_addrs(egress).and_then(|a| a.v4),
-        dispatcher.egress_addrs(dial.target).and_then(|a| a.v4),
+        dispatcher
+            .egress_addrs(egress)
+            .and_then(InterfaceAddresses::v4),
+        dispatcher
+            .egress_addrs(dial.target)
+            .and_then(InterfaceAddresses::v4),
     ) else {
         return payload; // a family the proxy can't bridge yet — forward unchanged
     };

@@ -6,7 +6,7 @@ use std::net::{IpAddr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
 use thiserror::Error;
 
-use crate::interface::InterfaceAddresses;
+use crate::interface::{InterfaceAddresses, Ipv6Scope};
 use crate::net::LinkType;
 use crate::net::frame::{self, FrameError};
 use crate::net::mac::MacAddr;
@@ -63,11 +63,12 @@ pub(super) fn build_udp(
 ) -> Result<usize, DatagramError> {
     match dst {
         SocketAddr::V4(dst) => {
-            let src = SocketAddrV4::new(addrs.v4.ok_or(DatagramError::NoSourceAddress)?, src_port);
+            let src =
+                SocketAddrV4::new(addrs.v4().ok_or(DatagramError::NoSourceAddress)?, src_port);
             match link {
                 LinkType::Ethernet => Ok(frame::ethernet_ipv4_udp(
                     dst_mac,
-                    addrs.mac.ok_or(DatagramError::NoSourceMac)?,
+                    addrs.mac().ok_or(DatagramError::NoSourceMac)?,
                     src,
                     dst,
                     ttl,
@@ -79,16 +80,16 @@ pub(super) fn build_udp(
             }
         }
         SocketAddr::V6(dst) => {
-            let src = SocketAddrV6::new(
-                addrs.v6.ok_or(DatagramError::NoSourceAddress)?,
-                src_port,
-                0,
-                0,
-            );
+            // Source the datagram from an address matching the destination's scope, so a site-local
+            // group (`ff05::c`) isn't sourced from a link-local address.
+            let src_ip = addrs
+                .v6(Ipv6Scope::of(*dst.ip()))
+                .ok_or(DatagramError::NoSourceAddress)?;
+            let src = SocketAddrV6::new(src_ip, src_port, 0, 0);
             match link {
                 LinkType::Ethernet => Ok(frame::ethernet_ipv6_udp(
                     dst_mac,
-                    addrs.mac.ok_or(DatagramError::NoSourceMac)?,
+                    addrs.mac().ok_or(DatagramError::NoSourceMac)?,
                     src,
                     dst,
                     ttl,
@@ -108,13 +109,46 @@ mod tests {
 
     use super::*;
 
-    /// A fully-populated egress: a MAC and both families, for the builder tests.
+    /// A fully-populated egress: a MAC, v4, a link-local v6, and a routable v6, for the builder tests.
     fn full_addrs() -> InterfaceAddresses {
-        InterfaceAddresses {
-            mac: Some(MacAddr::from([0x02, 0, 0, 0, 0, 0x01])),
-            v4: Some(Ipv4Addr::new(192, 168, 0, 2)),
-            v6: Some("fe80::2".parse().unwrap()),
-        }
+        InterfaceAddresses::new(
+            Some(MacAddr::from([0x02, 0, 0, 0, 0, 0x01])),
+            Some(Ipv4Addr::new(192, 168, 0, 2)),
+            Some("fe80::2".parse().unwrap()),
+            Some("2001:db8::2".parse().unwrap()),
+        )
+    }
+
+    #[test]
+    fn build_udp_sources_a_site_local_group_from_the_routable_address() {
+        // A site-local SSDP group (ff05::c) must be sourced from the routable address, not the
+        // link-local one — the per-scope selection.
+        let addrs = full_addrs();
+        let dst = SocketAddr::from((Ipv6Addr::new(0xff05, 0, 0, 0, 0, 0, 0, 0x0c), 1900));
+        let mut scratch = [0u8; 2048];
+        let n = build_udp(
+            &addrs,
+            LinkType::Ethernet,
+            dst,
+            MacAddr::multicast_for(dst.ip()),
+            4000,
+            2,
+            b"ssdp",
+            &mut scratch,
+        )
+        .unwrap();
+        // The IPv6 source address sits at bytes [22..38] of the frame (14 Ethernet + offset 8 into
+        // the v6 header). A site-local destination is sourced from the routable v6, not fe80::2.
+        assert_eq!(
+            &scratch[22..38],
+            "2001:db8::2"
+                .parse::<Ipv6Addr>()
+                .unwrap()
+                .octets()
+                .as_slice(),
+            "ff05::c sourced from the routable address"
+        );
+        assert!(n > 38);
     }
 
     #[test]
@@ -157,7 +191,7 @@ mod tests {
         .unwrap();
         // L2 header: the supplied destination MAC, the egress's own MAC as source.
         assert_eq!(&scratch[0..6], MacAddr::broadcast().octets().as_slice());
-        assert_eq!(&scratch[6..12], addrs.mac.unwrap().octets().as_slice());
+        assert_eq!(&scratch[6..12], addrs.mac().unwrap().octets().as_slice());
         assert!(n > 12, "frame must extend past the L2 header");
     }
 
@@ -180,7 +214,7 @@ mod tests {
         .unwrap();
         // 33:33 + the low 32 bits of ff02::1 (the supplied MAC), then the egress's own MAC.
         assert_eq!(&scratch[0..6], [0x33, 0x33, 0, 0, 0, 0x01].as_slice());
-        assert_eq!(&scratch[6..12], addrs.mac.unwrap().octets().as_slice());
+        assert_eq!(&scratch[6..12], addrs.mac().unwrap().octets().as_slice());
     }
 
     #[test]
@@ -204,17 +238,19 @@ mod tests {
         .unwrap();
         // The supplied unicast MAC is the L2 destination; the egress's own MAC is the source.
         assert_eq!(&scratch[0..6], searcher_mac.octets().as_slice());
-        assert_eq!(&scratch[6..12], addrs.mac.unwrap().octets().as_slice());
+        assert_eq!(&scratch[6..12], addrs.mac().unwrap().octets().as_slice());
         assert!(n > 12);
     }
 
     #[test]
     fn build_udp_needs_a_source_address_for_the_family() {
         // A v6-less egress cannot source a v6 datagram.
-        let v4_only = InterfaceAddresses {
-            v6: None,
-            ..full_addrs()
-        };
+        let v4_only = InterfaceAddresses::new(
+            Some(MacAddr::from([0x02, 0, 0, 0, 0, 0x01])),
+            Some(Ipv4Addr::new(192, 168, 0, 2)),
+            None,
+            None,
+        );
         let dst = SocketAddr::from((Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1), 9));
         let mut scratch = [0u8; 2048];
         assert_eq!(
@@ -234,10 +270,12 @@ mod tests {
 
     #[test]
     fn build_udp_ethernet_needs_a_source_mac() {
-        let no_mac = InterfaceAddresses {
-            mac: None,
-            ..full_addrs()
-        };
+        let no_mac = InterfaceAddresses::new(
+            None,
+            Some(Ipv4Addr::new(192, 168, 0, 2)),
+            Some("fe80::2".parse().unwrap()),
+            Some("2001:db8::2".parse().unwrap()),
+        );
         let dst = SocketAddr::from((Ipv4Addr::BROADCAST, 9));
         let mut scratch = [0u8; 2048];
         assert_eq!(
@@ -282,10 +320,12 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "freebsd"))]
     #[test]
     fn build_udp_dlt_null_needs_no_mac() {
-        let no_mac = InterfaceAddresses {
-            mac: None,
-            ..full_addrs()
-        };
+        let no_mac = InterfaceAddresses::new(
+            None,
+            Some(Ipv4Addr::new(192, 168, 0, 2)),
+            Some("fe80::2".parse().unwrap()),
+            Some("2001:db8::2".parse().unwrap()),
+        );
         let dst = SocketAddr::from((Ipv4Addr::BROADCAST, 9));
         let mut scratch = [0u8; 2048];
         build_udp(

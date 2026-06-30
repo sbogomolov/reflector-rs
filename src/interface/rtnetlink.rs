@@ -10,7 +10,7 @@ use std::ptr;
 
 use libc::c_int;
 
-use super::{InterfaceAddresses, v6_rank};
+use super::{InterfaceAddresses, V6Pick, v6_rank};
 use crate::net::mac::MacAddr;
 
 const NETLINK_ROUTE: c_int = 0;
@@ -122,14 +122,14 @@ pub(super) fn resolve(if_name: &str, ifindex: u32) -> io::Result<InterfaceAddres
     let sock = netlink_socket()?;
     let mut addrs = InterfaceAddresses::default();
 
-    let mut best_v6_rank = 0u8;
+    let mut v6_pick = V6Pick::default();
     dump(
         &sock,
         libc::RTM_GETADDR,
         libc::RTM_NEWADDR,
         IfAddrMsg::default(),
         |msg| {
-            scan_addr(msg, if_name, ifindex, &mut addrs, &mut best_v6_rank);
+            scan_addr(msg, if_name, ifindex, &mut addrs, &mut v6_pick);
         },
     )?;
     dump(
@@ -251,7 +251,7 @@ fn scan_addr(
     if_name: &str,
     ifindex: u32,
     addrs: &mut InterfaceAddresses,
-    best_v6_rank: &mut u8,
+    v6_pick: &mut V6Pick,
 ) {
     let body_at = nl_align(size_of::<NlMsgHdr>());
     let Some(body) = read_at::<IfAddrMsg>(msg, body_at) else {
@@ -301,12 +301,11 @@ fn scan_addr(
         let rank = v6_rank(addr);
         let usable = flags & IFA_F_UNUSABLE == 0;
         log::trace!(
-            "{if_name}: v6 {addr} flags {flags:#06x} rank {rank} -> {}",
+            "{if_name}: v6 {addr} flags {flags:#06x} rank {rank:?} -> {}",
             if usable { "usable" } else { "filtered" }
         );
-        if usable && (addrs.v6.is_none() || rank > *best_v6_rank) {
-            addrs.v6 = Some(addr);
-            *best_v6_rank = rank;
+        if usable {
+            v6_pick.consider(addrs, addr);
         }
     }
 }

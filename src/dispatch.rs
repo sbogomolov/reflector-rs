@@ -789,7 +789,9 @@ mod tests {
         let egress = dispatcher.add_capture(egress_cap)?;
         // The egress capture resolves to its interface's address — the seam reflectors read.
         assert_eq!(
-            dispatcher.egress_addrs(egress).and_then(|a| a.v4),
+            dispatcher
+                .egress_addrs(egress)
+                .and_then(InterfaceAddresses::v4),
             Some(Ipv4Addr::LOCALHOST),
         );
         let seen = Rc::new(RefCell::new(Vec::new()));
@@ -1135,7 +1137,9 @@ mod tests {
             dispatcher: &mut PacketDispatcher,
             _reactor: &mut Reactor,
         ) {
-            let addrs = dispatcher.egress_addrs(self.ingress).and_then(|a| a.v4);
+            let addrs = dispatcher
+                .egress_addrs(self.ingress)
+                .and_then(InterfaceAddresses::v4);
             let sent_ok = dispatcher.send(self.ingress, b"x").is_ok();
             *self.result.borrow_mut() = Some((addrs, sent_ok));
         }

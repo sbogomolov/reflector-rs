@@ -23,12 +23,51 @@ mod rtnetlink;
 
 pub(crate) use self::address_monitor::AddressMonitor;
 
-/// An interface's current source addresses; any may be absent.
+/// An interface's current source addresses; any may be absent. The fields are private so a sender
+/// reaches a v6 source only through [`v6`](Self::v6), naming the destination's scope: the stored
+/// best-overall source (link-local preferred) and best-non-link-local one (ULA or global) can't be
+/// grabbed directly and mismatched against the destination.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct InterfaceAddresses {
-    pub(crate) mac: Option<MacAddr>,
-    pub(crate) v4: Option<Ipv4Addr>,
-    pub(crate) v6: Option<Ipv6Addr>,
+    mac: Option<MacAddr>,
+    v4: Option<Ipv4Addr>,
+    v6: Option<Ipv6Addr>,
+    v6_routable: Option<Ipv6Addr>,
+}
+
+impl InterfaceAddresses {
+    /// The source MAC, if the link has one (a `DLT_NULL` / loopback link has none).
+    pub(crate) fn mac(&self) -> Option<MacAddr> {
+        self.mac
+    }
+
+    /// The IPv4 source address, if any. IPv4 is scopeless, so — unlike
+    /// [`v6`](Self::v6) — it needs no destination argument.
+    pub(crate) fn v4(&self) -> Option<Ipv4Addr> {
+        self.v4
+    }
+
+    /// The best v6 source for a destination of `dest_scope`: a link-local source for a link-local
+    /// destination, a routable (ULA/global) source for a wider one. Falls back to the other scope's
+    /// address when the matching one is absent — a scope mismatch, but better than dropping the send
+    /// (and what the single-address pick did before `v6_routable` existed).
+    pub(crate) fn v6(&self, dest_scope: Ipv6Scope) -> Option<Ipv6Addr> {
+        match dest_scope {
+            Ipv6Scope::LinkLocal => self.v6,
+            Ipv6Scope::Routable => self.v6_routable.or(self.v6),
+        }
+    }
+
+    /// Whether the interface can currently source IPv4 — the per-family availability gate.
+    pub(crate) fn has_v4(&self) -> bool {
+        self.v4.is_some()
+    }
+
+    /// Whether the interface can currently source IPv6, in any scope. The best-overall source is set
+    /// whenever any usable v6 address exists, so this answers "is there a v6 source at all".
+    pub(crate) fn has_v6(&self) -> bool {
+        self.v6.is_some()
+    }
 }
 
 impl fmt::Display for InterfaceAddresses {
@@ -45,6 +84,11 @@ impl fmt::Display for InterfaceAddresses {
         }
         f.write_str(", v6 ")?;
         match self.v6 {
+            Some(v6) => write!(f, "{v6}")?,
+            None => f.write_str("none")?,
+        }
+        f.write_str(", v6-routable ")?;
+        match self.v6_routable {
             Some(v6) => write!(f, "{v6}"),
             None => f.write_str("none"),
         }
@@ -59,6 +103,29 @@ pub(crate) struct AddressChange {
     pub(crate) mac: bool,
     pub(crate) v4: bool,
     pub(crate) v6: bool,
+}
+
+/// An IPv6 destination's scope, coarsened to what matters for source selection: a link-local
+/// destination (`fe80::/10`, or a link-local-scoped multicast group like `ff02::`) wants a link-local
+/// source; anything wider wants a routable one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Ipv6Scope {
+    LinkLocal,
+    /// Site-local, ULA, or global — anything routed beyond the local link (not necessarily a GUA).
+    Routable,
+}
+
+impl Ipv6Scope {
+    /// The scope of `addr`: link-local if it's a link-local-scoped multicast group or a link-local
+    /// unicast address ([`Ipv6Addr::is_unicast_link_local`]), else routable. Only the multicast side is
+    /// hand-rolled, because `Ipv6Addr::multicast_scope` is unstable (feature `ip`).
+    pub(crate) fn of(addr: Ipv6Addr) -> Self {
+        if is_multicast_link_local(addr) || addr.is_unicast_link_local() {
+            Self::LinkLocal
+        } else {
+            Self::Routable
+        }
+    }
 }
 
 /// One configured interface: its name (kept for re-resolution), kernel ifindex (the address
@@ -101,10 +168,19 @@ impl Interface {
         #[cfg(target_os = "linux")]
         let addrs = self::rtnetlink::resolve(&self.name, self.ifindex)?;
         log::debug!("{}: resolved {addrs}", self.name);
+        // Both v6 transitions are logged (the `let`s run before the `||`), and either folds into the
+        // single `v6` change bit, since no caller distinguishes the two v6 sources.
+        let v6 = log_field_change(&self.name, "IPv6", self.addrs.v6, addrs.v6);
+        let v6_routable = log_field_change(
+            &self.name,
+            "IPv6 routable",
+            self.addrs.v6_routable,
+            addrs.v6_routable,
+        );
         let change = AddressChange {
             mac: log_field_change(&self.name, "MAC", self.addrs.mac, addrs.mac),
             v4: log_field_change(&self.name, "IPv4", self.addrs.v4, addrs.v4),
-            v6: log_field_change(&self.name, "IPv6", self.addrs.v6, addrs.v6),
+            v6: v6 || v6_routable,
         };
         self.addrs = addrs;
         Ok(change)
@@ -141,19 +217,68 @@ fn log_field_change<A: PartialEq + fmt::Display>(
     true
 }
 
-/// Rank an IPv6 source candidate: link-local > ULA > global > other. The reflector reflects
-/// link-local service traffic, so a link-local source is preferred; a global address is
-/// the fallback when no link-local is usable.
-fn v6_rank(addr: Ipv6Addr) -> u8 {
-    let o = addr.octets();
-    if o[0] == 0xff || addr.is_unspecified() || addr.is_loopback() {
-        0 // multicast / :: / ::1 — never a real source
-    } else if o[0] == 0xfe && (o[1] & 0xc0) == 0x80 {
-        3 // link-local fe80::/10
-    } else if (o[0] & 0xfe) == 0xfc {
-        2 // unique local fc00::/7
+/// An IPv6 source candidate's rank, ordered worst-to-best so a higher variant outranks a lower one
+/// (the derived `Ord` follows declaration order). The reflector reflects link-local service traffic, so
+/// a link-local source is preferred, then ULA, then global; a multicast / `::` / `::1` address is never
+/// a source.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Debug)]
+enum V6Rank {
+    #[default]
+    NotASource,
+    Global,
+    UniqueLocal,
+    LinkLocal,
+}
+
+/// Rank an IPv6 source candidate by how good a source it is (see [`V6Rank`]).
+fn v6_rank(addr: Ipv6Addr) -> V6Rank {
+    if addr.is_multicast() || addr.is_unspecified() || addr.is_loopback() {
+        V6Rank::NotASource // multicast / :: / ::1 — never a real source
+    } else if addr.is_unicast_link_local() {
+        V6Rank::LinkLocal // fe80::/10
+    } else if addr.is_unique_local() {
+        V6Rank::UniqueLocal // fc00::/7
     } else {
-        1 // global / other
+        V6Rank::Global
+    }
+}
+
+/// Whether `addr` is a link-local-scoped multicast group (`ff02::`): a multicast address (`ff00::/8`)
+/// whose scope nibble is `2`. Hand-rolled because `Ipv6Addr::multicast_scope` — the natural fit — is
+/// unstable (feature `ip`), unlike the unicast/ULA classifiers we take from std. The `is_multicast`
+/// check isn't a redundant guard: the scope nibble alone also matches unicasts like `fd02::` or `2012::`.
+fn is_multicast_link_local(addr: Ipv6Addr) -> bool {
+    addr.is_multicast() && (addr.octets()[1] & 0x0f) == 0x02
+}
+
+/// Picks the best v6 source addresses while a backend scans an interface's usable addresses: the
+/// highest-ranked overall ([`v6`](InterfaceAddresses::v6), link-local preferred) and the highest-ranked
+/// non-link-local ([`v6_routable`](InterfaceAddresses::v6_routable), for site-local/global sends). Both
+/// platform backends feed it their usable candidates, so the per-scope pick lives in one place.
+#[derive(Default)]
+pub(super) struct V6Pick {
+    best_rank: V6Rank,
+    best_routable_rank: V6Rank,
+}
+
+impl V6Pick {
+    /// Consider a usable v6 source `addr`, updating `addrs` if it outranks the current pick(s).
+    pub(super) fn consider(&mut self, addrs: &mut InterfaceAddresses, addr: Ipv6Addr) {
+        let rank = v6_rank(addr);
+        if rank == V6Rank::NotASource {
+            return; // multicast / :: / ::1
+        }
+        if addrs.v6.is_none() || rank > self.best_rank {
+            addrs.v6 = Some(addr);
+            self.best_rank = rank;
+        }
+        // The best non-link-local source (ranked below LinkLocal), for site-local/global destinations.
+        if rank < V6Rank::LinkLocal
+            && (addrs.v6_routable.is_none() || rank > self.best_routable_rank)
+        {
+            addrs.v6_routable = Some(addr);
+            self.best_routable_rank = rank;
+        }
     }
 }
 
@@ -167,6 +292,24 @@ pub(crate) const LOOPBACK_IFACE: &str = "lo0";
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    impl InterfaceAddresses {
+        /// Construct a record directly, for tests in other modules (the fields are private, so they
+        /// can't use a struct literal). Production builds these through the platform resolvers.
+        pub(crate) fn new(
+            mac: Option<MacAddr>,
+            v4: Option<Ipv4Addr>,
+            v6: Option<Ipv6Addr>,
+            v6_routable: Option<Ipv6Addr>,
+        ) -> Self {
+            Self {
+                mac,
+                v4,
+                v6,
+                v6_routable,
+            }
+        }
+    }
 
     #[test]
     fn resolves_loopback_v4() {
@@ -213,6 +356,72 @@ mod tests {
         assert!(v6_rank(ll) > v6_rank(ula));
         assert!(v6_rank(ula) > v6_rank(global));
         assert!(v6_rank(global) > v6_rank(Ipv6Addr::LOCALHOST));
+    }
+
+    #[test]
+    fn ipv6_scope_of_reads_multicast_and_unicast() {
+        // Link-local-scoped multicast (ff02::) and link-local unicast (fe80::) are LinkLocal; the
+        // site-local SSDP group (ff05::) and a global address are wider (Routable).
+        assert_eq!(
+            Ipv6Scope::of("ff02::c".parse().unwrap()),
+            Ipv6Scope::LinkLocal
+        );
+        assert_eq!(
+            Ipv6Scope::of("fe80::1".parse().unwrap()),
+            Ipv6Scope::LinkLocal
+        );
+        assert_eq!(
+            Ipv6Scope::of("ff05::c".parse().unwrap()),
+            Ipv6Scope::Routable
+        );
+        assert_eq!(
+            Ipv6Scope::of("2001:db8::1".parse().unwrap()),
+            Ipv6Scope::Routable
+        );
+        // A ULA whose second byte's low nibble is 2 (fd02::) must not be mistaken for a link-local
+        // multicast group — the `is_multicast` half of is_multicast_link_local guards exactly this.
+        assert_eq!(
+            Ipv6Scope::of("fd02::1".parse().unwrap()),
+            Ipv6Scope::Routable
+        );
+    }
+
+    #[test]
+    fn v6_picks_by_scope_and_falls_back() {
+        let both = InterfaceAddresses {
+            v6: Some("fe80::1".parse().unwrap()),
+            v6_routable: Some("2001:db8::1".parse().unwrap()),
+            ..Default::default()
+        };
+        assert_eq!(both.v6(Ipv6Scope::LinkLocal), both.v6);
+        assert_eq!(both.v6(Ipv6Scope::Routable), both.v6_routable);
+        // No routable address: a wider destination falls back to the link-local one (prior behavior).
+        let link_only = InterfaceAddresses {
+            v6: Some("fe80::1".parse().unwrap()),
+            ..Default::default()
+        };
+        assert_eq!(link_only.v6(Ipv6Scope::Routable), link_only.v6);
+        // No v6 at all: nothing to source.
+        assert_eq!(InterfaceAddresses::default().v6(Ipv6Scope::Routable), None);
+    }
+
+    #[test]
+    fn v6_pick_tracks_best_overall_and_best_routable() {
+        let mut addrs = InterfaceAddresses::default();
+        let mut pick = V6Pick::default();
+        pick.consider(&mut addrs, "2001:db8::1".parse().unwrap()); // global
+        pick.consider(&mut addrs, "fc00::1".parse().unwrap()); // ULA — outranks global
+        pick.consider(&mut addrs, "fe80::1".parse().unwrap()); // link-local — best overall
+        assert_eq!(
+            addrs.v6,
+            Some("fe80::1".parse::<Ipv6Addr>().unwrap()),
+            "best overall is the link-local"
+        );
+        assert_eq!(
+            addrs.v6_routable,
+            Some("fc00::1".parse::<Ipv6Addr>().unwrap()),
+            "best non-link-local is the ULA"
+        );
     }
 
     // Opt-in diagnostic: trace-log every address (and each v6's flag status) the resolver

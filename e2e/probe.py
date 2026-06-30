@@ -144,6 +144,13 @@ def receive(args: argparse.Namespace) -> int:
                 return 1
 
             if payload == expected:
+                if args.expect_source_not_link_local and peer[0].lower().startswith("fe80"):
+                    print(
+                        f"forwarded from link-local source {peer[0]}; expected a routable (non-fe80::) address",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    return 1
                 return 0
 
             print("received payload does not match expected magic packet", file=sys.stderr, flush=True)
@@ -638,6 +645,8 @@ def main() -> int:
     expectation.add_argument("--expect-mac", help="MAC address whose magic packet must be received")
     expectation.add_argument("--expect-payload-hex", type=parse_payload_hex, help="exact UDP payload that must be received")
     expectation.add_argument("--expect-none", action="store_true", help="fail if any UDP packet is received")
+    receive_parser.add_argument("--expect-source-not-link-local", action="store_true",
+                                help="also require the matched packet's source to be a routable (non-fe80::) address")
     receive_parser.set_defaults(func=receive)
 
     respond_parser = subparsers.add_parser("respond", help="receive one datagram, then unicast a reply to its sender")

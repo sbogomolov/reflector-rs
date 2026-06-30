@@ -5,6 +5,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use crate::dispatch::{CaptureKey, Filter, PacketDispatcher, PacketHandler, RegistrationKey};
+use crate::interface::{InterfaceAddresses, Ipv6Scope};
 use crate::net::mac::MacAddr;
 use crate::net::packet::Packet;
 use crate::net::port_reservation::PortReservation;
@@ -158,15 +159,17 @@ impl SsdpSearchReflector {
             );
             return None;
         };
-        // The 200-OKs come to the target's own address of the search's family, at the reserved port.
+        // The 200-OKs come to the address the reflected M-SEARCH is sourced from, at the reserved
+        // port — so this must be the same scope-matched pick `build_udp` makes for `packet.dest`,
+        // or the device replies to a source the response capture below isn't watching.
         let our_addr = match packet.dest.ip() {
             IpAddr::V4(_) => dispatcher
                 .egress_addrs(self.target)
-                .and_then(|a| a.v4)
+                .and_then(InterfaceAddresses::v4)
                 .map(IpAddr::V4),
-            IpAddr::V6(_) => dispatcher
+            IpAddr::V6(dst6) => dispatcher
                 .egress_addrs(self.target)
-                .and_then(|a| a.v6)
+                .and_then(|a| a.v6(Ipv6Scope::of(dst6)))
                 .map(IpAddr::V6),
         };
         let Some(our_addr) = our_addr else {

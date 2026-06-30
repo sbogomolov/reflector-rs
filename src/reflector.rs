@@ -79,17 +79,17 @@ fn egress_sources(dispatcher: &PacketDispatcher, egress: CaptureKey, dst: Socket
     dispatcher
         .egress_addrs(egress)
         .is_some_and(|addrs| match dst {
-            SocketAddr::V4(_) => addrs.v4.is_some(),
-            SocketAddr::V6(_) => addrs.v6.is_some(),
+            SocketAddr::V4(_) => addrs.has_v4(),
+            SocketAddr::V6(_) => addrs.has_v6(),
         })
 }
 
 /// The family `addrs` cannot source but `family` requires, if any — the startup check's verdict.
 /// `None` means every required family is available (a v6-best-effort `Default` with no v6 passes).
 fn missing_required_family(family: AddressFamily, addrs: &InterfaceAddresses) -> Option<IpFamily> {
-    if family.requires_ipv4() && addrs.v4.is_none() {
+    if family.requires_ipv4() && !addrs.has_v4() {
         Some(IpFamily::V4)
-    } else if family.requires_ipv6() && addrs.v6.is_none() {
+    } else if family.requires_ipv6() && !addrs.has_v6() {
         Some(IpFamily::V6)
     } else {
         None
@@ -98,9 +98,9 @@ fn missing_required_family(family: AddressFamily, addrs: &InterfaceAddresses) ->
 
 /// Enforce that a bidirectional reflector can source every required family on BOTH interfaces.
 /// mDNS and SSDP re-emit on the source *and* the target, so a family required by `address_family`
-/// must be sendable on each: AND the two interfaces' addresses and run [`missing_required_family`]
-/// over the combined view, blaming the side that actually lacks the family (the source when it's
-/// the one missing it, otherwise the target).
+/// must be sendable on each. Checks each required family on both interfaces (v4 before v6, the
+/// single-interface policy order) and blames the side that actually lacks it — the source when it's
+/// the one missing, otherwise the target.
 ///
 /// # Errors
 /// [`BuildError::RequiredFamilyUnavailable`] naming the interface and the family it can't send.
@@ -114,23 +114,22 @@ fn require_bidirectional_families(
 ) -> Result<(), BuildError> {
     let src = dispatcher.egress_addrs(source).copied().unwrap_or_default();
     let tgt = dispatcher.egress_addrs(target).copied().unwrap_or_default();
-    let both = InterfaceAddresses {
-        v4: src.v4.and(tgt.v4),
-        v6: src.v6.and(tgt.v6),
-        mac: tgt.mac, // unused by the family check
-    };
-    let Some(family) = missing_required_family(address_family, &both) else {
-        return Ok(());
-    };
-    let interface = match family {
-        IpFamily::V4 if src.v4.is_none() => source_if,
-        IpFamily::V6 if src.v6.is_none() => source_if,
-        _ => target_if,
-    };
-    Err(BuildError::RequiredFamilyUnavailable {
-        interface: interface.to_owned(),
+    let unavailable = |family, missing_on_source| BuildError::RequiredFamilyUnavailable {
+        interface: if missing_on_source {
+            source_if
+        } else {
+            target_if
+        }
+        .to_owned(),
         family,
-    })
+    };
+    if address_family.requires_ipv4() && !(src.has_v4() && tgt.has_v4()) {
+        return Err(unavailable(IpFamily::V4, !src.has_v4()));
+    }
+    if address_family.requires_ipv6() && !(src.has_v6() && tgt.has_v6()) {
+        return Err(unavailable(IpFamily::V6, !src.has_v6()));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -142,10 +141,7 @@ mod tests {
     #[test]
     fn missing_required_family_enforces_the_requires_policy() {
         let none = InterfaceAddresses::default();
-        let v4_only = InterfaceAddresses {
-            v4: Some(Ipv4Addr::LOCALHOST),
-            ..Default::default()
-        };
+        let v4_only = InterfaceAddresses::new(None, Some(Ipv4Addr::LOCALHOST), None, None);
         // Default requires v4 only: a v4-less egress fails on v4, a v6-less one passes.
         assert_eq!(
             missing_required_family(AddressFamily::Default, &none),

@@ -11,7 +11,7 @@ use std::ptr;
 
 use libc::c_int;
 
-use super::{InterfaceAddresses, v6_rank};
+use super::{InterfaceAddresses, V6Pick, v6_rank};
 use crate::net::mac::MacAddr;
 
 /// `IN6_IFF_*` bits that disqualify a v6 address as a source: DAD in progress, DAD failed
@@ -35,7 +35,7 @@ pub(super) fn resolve(if_name: &str) -> io::Result<InterfaceAddresses> {
     }
 
     let mut addrs = InterfaceAddresses::default();
-    let mut best_v6_rank = 0u8;
+    let mut v6_pick = V6Pick::default();
     let mut node = head;
     while !node.is_null() {
         // SAFETY: `node` points at a live list entry owned by `head`, valid until
@@ -89,14 +89,13 @@ pub(super) fn resolve(if_name: &str) -> io::Result<InterfaceAddresses> {
                 let rank = v6_rank(addr);
                 match flags {
                     Some(f) => log::trace!(
-                        "{if_name}: v6 {addr} flags {f:#06x} rank {rank} -> {}",
+                        "{if_name}: v6 {addr} flags {f:#06x} rank {rank:?} -> {}",
                         if usable { "usable" } else { "filtered" }
                     ),
                     None => log::trace!("{if_name}: v6 {addr} flag query failed -> filtered"),
                 }
-                if usable && (addrs.v6.is_none() || rank > best_v6_rank) {
-                    addrs.v6 = Some(addr);
-                    best_v6_rank = rank;
+                if usable {
+                    v6_pick.consider(&mut addrs, addr);
                 }
             }
             _ => {}
