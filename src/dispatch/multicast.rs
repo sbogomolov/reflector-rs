@@ -100,14 +100,18 @@ impl MulticastJoiner {
                 .insert(open_socket(family, libc::SOCK_DGRAM)?)
                 .as_raw_fd(),
         };
-        let req = GroupReq {
-            gr_interface: self.ifindex,
-            // The membership selects the interface by `gr_interface` (the index), so the group
-            // sockaddr carries no scope id.
-            gr_group: sockaddr_for(group, 0, 0).0,
-        };
-        // SAFETY: `req` is a fully-initialized `group_req`; we pass its address and own size as the
-        // option value and length for the protocol-independent join at the family's IP level.
+        // Zero the whole struct before setting fields: a field-by-field literal leaves the 4 bytes of
+        // padding after `gr_interface` uninitialised, and `setsockopt` reads the struct's full size, so a
+        // syscall would be handed uninitialised bytes (Valgrind flags it, and it is plainly incorrect).
+        // SAFETY: `group_req` is plain data with no invalid bit patterns; all-zero is a valid value.
+        let mut req: GroupReq = unsafe { std::mem::zeroed() };
+        req.gr_interface = self.ifindex;
+        // The membership selects the interface by `gr_interface` (the index), so the group sockaddr
+        // carries no scope id.
+        req.gr_group = sockaddr_for(group, 0, 0).0;
+        // SAFETY: `req` is now a fully-initialized `group_req` (its padding zeroed); we pass its address
+        // and own size as the option value and length for the protocol-independent join at the family's
+        // IP level.
         let rc = unsafe {
             libc::setsockopt(
                 fd,
