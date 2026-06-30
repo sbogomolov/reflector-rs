@@ -121,9 +121,11 @@ jobs:
         run: |
           bin="dist/reflector-${{ github.ref_name }}-${{ matrix.variant }}"
           file "$bin"
-          # musl's +crt-static yields a static-pie binary: static (no shared libs) but PIE for ASLR.
-          file "$bin" | grep -q 'static-pie linked' \
-            || { echo "::error::binary is not static-pie linked"; exit 1; }
+          # The musl binary has no shared-library deps (the invariant that matters), but its PIE-ness
+          # varies by arch -- x86_64 is static-pie, the ARM targets are plain static -- so accept either
+          # "statically linked" or "static-pie linked"; only a dynamically-linked binary fails.
+          file "$bin" | grep -qE 'statically linked|static-pie linked' \
+            || { echo "::error::binary is not statically/static-pie linked"; exit 1; }
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@v7
@@ -168,10 +170,10 @@ jobs:
               cargo build --release --locked --target ${{ matrix.vm_arch }}-unknown-freebsd
             bin="target/${{ matrix.vm_arch }}-unknown-freebsd/release/reflector"
             file "$bin"
-            # FreeBSD's +crt-static yields a plain (non-PIE) static binary -- no shared libs, so one
-            # binary runs across FreeBSD majors.
-            file "$bin" | grep -q 'statically linked' \
-              || { echo "::error::freebsd binary is not statically linked"; exit 1; }
+            # A static binary has no shared-library deps, so one binary runs across FreeBSD majors.
+            # FreeBSD is plain non-PIE static; accept a static-pie form too, for parity with Linux.
+            file "$bin" | grep -qE 'statically linked|static-pie linked' \
+              || { echo "::error::freebsd binary is not statically/static-pie linked"; exit 1; }
             mkdir -p dist
             cp "$bin" "dist/reflector-${{ github.ref_name }}-freebsd-${{ matrix.arch }}"
 
