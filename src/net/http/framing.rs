@@ -656,13 +656,17 @@ mod tests {
 
     #[test]
     fn a_near_max_chunk_size_is_refused_not_overflowed() {
-        // A hostile/buggy device sends a 16-hex-digit chunk size (usize::MAX on a 64-bit target). It is
-        // under MAX_CHUNK_LINE so it passes the line-length guard; adding the terminating CRLF would
-        // overflow, so the framer must refuse it cleanly rather than panic (debug) or wrap (release).
+        // A hostile/buggy device sends the largest chunk size that fits `usize` on this target (its hex
+        // width tracks the pointer width). It is under MAX_CHUNK_LINE so it passes the line-length guard;
+        // adding the terminating CRLF would overflow, so the framer must refuse it cleanly rather than
+        // panic (debug) or wrap (release).
         let mut f = HttpFraming::new(Kind::Response, RewritePolicy::NONE);
-        let input = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nffffffffffffffff\r\n";
+        let input = format!(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n",
+            usize::MAX
+        );
         assert!(matches!(
-            f.feed(input),
+            f.feed(input.as_bytes()),
             Err(FramingError::ChunkSizeTooLarge)
         ));
     }

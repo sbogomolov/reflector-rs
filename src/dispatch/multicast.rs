@@ -139,6 +139,18 @@ fn already_member(err: &io::Error) -> bool {
     matches!(err.raw_os_error(), Some(libc::EADDRINUSE | libc::EINVAL))
 }
 
+/// Whether a join error means this environment can't perform the join at all, rather than a real
+/// rejection — the cue for the join tests to self-skip. QEMU user-mode emulation doesn't implement the
+/// `MCAST_JOIN_GROUP` setsockopt and returns `ENOPROTOOPT`; treat that and the kindred "unsupported"
+/// errnos as a skip, never as a pass. This is a test seam only: at runtime these stay fatal.
+#[cfg(test)]
+pub(crate) fn join_unsupported(err: &io::Error) -> bool {
+    matches!(
+        err.raw_os_error(),
+        Some(libc::ENOPROTOOPT | libc::EOPNOTSUPP | libc::ENOSYS)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
@@ -170,12 +182,22 @@ mod tests {
         // Exercises the full MCAST_JOIN_GROUP FFI against the kernel — the per-OS const, the
         // hand-rolled group_req layout, by-index selection. Loopback accepts the join on both Linux
         // and the BSDs (the by-index option doesn't require the interface's IFF_MULTICAST flag).
+        // QEMU user-mode emulation doesn't implement the setsockopt, so self-skip there.
         let mut joiner = MulticastJoiner::new(loopback_ifindex());
-        joiner
-            .join(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251)))
-            .expect("kernel accepts the v4 mDNS group join");
-        joiner
-            .join(IpAddr::V6(Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0xfb)))
-            .expect("kernel accepts the v6 mDNS group join");
+        for group in [
+            IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251)),
+            IpAddr::V6(Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0xfb)),
+        ] {
+            match joiner.join(group) {
+                Ok(()) => {}
+                Err(e) if join_unsupported(&e) => {
+                    eprintln!(
+                        "skip kernel_accepts_a_join: MCAST_JOIN_GROUP unsupported here ({e})"
+                    );
+                    return;
+                }
+                Err(e) => panic!("kernel must accept the {group} group join: {e}"),
+            }
+        }
     }
 }

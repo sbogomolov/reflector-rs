@@ -603,7 +603,6 @@ mod tests {
     use super::*;
     use crate::capture::open_or_skip;
     use crate::interface::LOOPBACK_IFACE;
-    use crate::net::frame;
     use std::cell::{Cell, RefCell};
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
     use std::rc::Rc;
@@ -738,7 +737,6 @@ mod tests {
     /// through the dispatcher — and records what it saw. The seam `WoL` et al. will fill.
     struct Echo {
         egress: CaptureKey,
-        scratch: Box<[u8]>,
         seen: Seen,
     }
 
@@ -752,20 +750,20 @@ mod tests {
             let (SocketAddr::V4(src), SocketAddr::V4(dst)) = (packet.source, packet.dest) else {
                 return;
             };
-            let mac = MacAddr::from([0xff; 6]);
-            let dst = SocketAddrV4::new(*dst.ip(), ECHO_DST_PORT);
-            let sent = match frame::ethernet_ipv4_udp(
-                mac,
-                mac,
-                src,
-                dst,
-                packet.ttl,
-                packet.payload,
-                &mut self.scratch,
-            ) {
-                Ok(n) => dispatcher.send(self.egress, &self.scratch[..n]).is_ok(),
-                Err(_) => false,
-            };
+            let dst = SocketAddr::V4(SocketAddrV4::new(*dst.ip(), ECHO_DST_PORT));
+            // Re-emit through the real link-aware send so the framing matches the egress link type
+            // (Ethernet vs DLT_NULL) instead of a hardcoded Ethernet frame, which a DLT_NULL loopback
+            // (the BSDs) rejects.
+            let sent = dispatcher
+                .send_udp(
+                    self.egress,
+                    dst,
+                    MacAddr::from([0xff; 6]),
+                    src.port(),
+                    packet.ttl,
+                    packet.payload,
+                )
+                .is_ok();
             self.seen.borrow_mut().push((packet.payload.to_vec(), sent));
         }
     }
@@ -803,7 +801,6 @@ mod tests {
             },
             Box::new(Echo {
                 egress,
-                scratch: vec![0u8; 2048].into_boxed_slice(),
                 seen: seen.clone(),
             }),
         );
@@ -1074,7 +1071,6 @@ mod tests {
             },
             Box::new(Echo {
                 egress,
-                scratch: vec![0u8; 2048].into_boxed_slice(),
                 seen: seen.clone(),
             }),
         );

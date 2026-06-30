@@ -207,6 +207,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(debug_assertions),
+        ignore = "consume's guard is a debug_assert!, compiled out in release"
+    )]
     #[should_panic(expected = "consume past the filled bytes")]
     fn consuming_past_the_filled_bytes_panics() {
         let mut b = StreamBuffer::with_capacity(4);

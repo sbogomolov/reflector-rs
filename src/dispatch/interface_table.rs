@@ -224,6 +224,7 @@ mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
 
     use super::*;
+    use crate::dispatch::multicast::join_unsupported;
     use crate::interface::{LOOPBACK_IFACE, if_index};
 
     // refresh_by_ifindex re-resolves only the interface(s) with the matching kernel index, reporting
@@ -255,11 +256,19 @@ mod tests {
     fn join_on_records_a_membership_and_refresh_re_attempts_it() -> io::Result<()> {
         let mut table = InterfaceTable::new();
         let iface = table.find_or_add_interface(LOOPBACK_IFACE)?;
-        table.join_on(iface, IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251)))?;
-        table.join_on(
-            iface,
+        for group in [
+            IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251)),
             IpAddr::V6(Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0xfb)),
-        )?;
+        ] {
+            // QEMU user-mode emulation doesn't implement the join setsockopt; self-skip there.
+            if let Err(e) = table.join_on(iface, group) {
+                if join_unsupported(&e) {
+                    eprintln!("skip join_on_records: MCAST_JOIN_GROUP unsupported here ({e})");
+                    return Ok(());
+                }
+                return Err(e);
+            }
+        }
         // The recorded memberships survive a refresh, re-attempted idempotently (each interface
         // resolves cleanly).
         let results = table.refresh_all();
