@@ -74,7 +74,11 @@ impl TcpSocket {
     /// Propagates the socket / pin / `bind` / `connect` failure (other than the in-progress sentinel).
     pub(crate) fn connect(dst: SocketAddrV4, source: Ipv4Addr, ifindex: u32) -> io::Result<Self> {
         let fd = open_socket(libc::AF_INET, libc::SOCK_STREAM)?;
+        // FreeBSD has no egress-pin primitive; the source-address bind below steers egress.
+        #[cfg(not(target_os = "freebsd"))]
         pin_egress(fd.as_raw_fd(), ifindex)?;
+        #[cfg(target_os = "freebsd")]
+        let _ = ifindex;
         bind_v4(fd.as_raw_fd(), source, 0)?;
         let local_addr = local_addr_v4(fd.as_raw_fd())?;
         let connecting = connect_v4(fd.as_raw_fd(), dst)?;
@@ -291,7 +295,9 @@ fn so_error(fd: RawFd) -> io::Result<c_int> {
 
 /// Constrain `fd`'s egress to interface `ifindex` so a route lookup can't leak the connect onto the
 /// wrong segment; `ifindex == 0` skips the pin. Linux uses `SO_BINDTODEVICE` (needs `CAP_NET_RAW`),
-/// macOS `IP_BOUND_IF`; the BSDs have no pin and rely on the source-address bind.
+/// macOS `IP_BOUND_IF`. FreeBSD has no pin primitive, so the caller skips it and relies on the
+/// source-address bind.
+#[cfg(not(target_os = "freebsd"))]
 fn pin_egress(fd: RawFd, ifindex: u32) -> io::Result<()> {
     if ifindex == 0 {
         return Ok(());
@@ -337,10 +343,6 @@ fn pin_egress(fd: RawFd, ifindex: u32) -> io::Result<()> {
         if rc != 0 {
             return Err(io::Error::last_os_error());
         }
-    }
-    #[cfg(target_os = "freebsd")]
-    {
-        let _ = fd; // no pin primitive; the source-address bind steers egress
     }
     Ok(())
 }
