@@ -1,0 +1,281 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - '**.md'
+  pull_request:
+    paths-ignore:
+      - '**.md'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # "Rebase and merge" rewrites the committer, so the commit that lands on main gets a fresh SHA even when
+  # its tree (the file snapshot) and parent are identical to the PR head CI already validated -- matching on
+  # the commit SHA therefore never skips. This gate matches on the tree instead: on push only, if a
+  # pull_request CI run already passed for a commit with the same tree, the result is guaranteed identical,
+  # so it skips the heavy jobs below. The gate itself still succeeds, so release.yml's wait for a green
+  # ci.yml run on the commit still holds. A merge rebased onto a moved main (different tree) and direct
+  # pushes to main match no prior tree, so the full suite runs. The gate runs only on push, so pull_request
+  # CI is never delayed by it.
+  gate:
+    name: Gate (skip if this tree already passed CI)
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      run: ${{ steps.decide.outputs.run }}
+    steps:
+      - name: Decide whether the heavy jobs should run
+        id: decide
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          repo="${{ github.repository }}"
+          tree=$(gh api "repos/$repo/git/commits/${{ github.sha }}" --jq '.tree.sha' 2>/dev/null || true)
+          if [ -z "$tree" ]; then
+            echo "Could not resolve the tree for ${{ github.sha }}; running the full suite."
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Distinct head SHAs of recent successful pull_request CI runs, most-recent first (so a just-merged
+          # PR matches on the first iteration). The PR head commit stays fetchable as refs/pull/<n>/head.
+          candidates=$(gh api \
+            "repos/$repo/actions/workflows/ci.yml/runs?status=success&event=pull_request&per_page=50" \
+            --jq '.workflow_runs[].head_sha' 2>/dev/null | awk 'NF && !seen[$0]++' || true)
+          for sha in $candidates; do
+            t=$(gh api "repos/$repo/git/commits/$sha" --jq '.tree.sha' 2>/dev/null || true)
+            if [ -n "$t" ] && [ "$t" = "$tree" ]; then
+              echo "Tree $tree already passed CI via pull-request commit $sha; skipping the heavy jobs."
+              echo "run=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
+          echo "No prior passing run for tree $tree; running the full suite."
+          echo "run=true" >> "$GITHUB_OUTPUT"
+
+  # rustfmt is target-independent, so run it once.
+  fmt:
+    name: Format
+    needs: gate
+    if: ${{ !cancelled() && (needs.gate.result != 'success' || needs.gate.outputs.run == 'true') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+      - name: rustfmt
+        run: cargo fmt --check
+
+  # clippy + the rustdoc intra-link gate, per supported target. clippy/build/doc only analyze the code active
+  # for the *target* platform, so each cfg(target_os) backend must be linted under its own --target. Both are
+  # check-only (no link), so every target runs on one Linux runner with just `rustup target add` -- no
+  # macOS/FreeBSD host, no cross-linker, no QEMU (the same mechanism as the `cargo check --target
+  # x86_64-unknown-freebsd` gate). Every shipped target is linted, not one per OS: the source has no
+  # target_arch cfgs, but libc/usize widths differ, so the 32- and 64-bit checks aren't redundant.
+  # (aarch64-unknown-freebsd is tier 3 -- no rustup std -- and is the same 64-bit-LE code as the amd64
+  # FreeBSD lane, which covers it.) The Cargo.toml [lints.rustdoc] denies make `cargo doc` the link gate.
+  lint:
+    name: Lint (${{ matrix.target }})
+    needs: gate
+    if: ${{ !cancelled() && (needs.gate.result != 'success' || needs.gate.outputs.run == 'true') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+          - armv7-unknown-linux-musleabihf
+          - arm-unknown-linux-musleabi
+          - x86_64-unknown-freebsd
+          - aarch64-apple-darwin
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+      - name: Cache cargo build
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-lint-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-lint-${{ matrix.target }}-
+      - name: Add the Rust target
+        run: rustup target add ${{ matrix.target }}
+      - name: Show toolchain
+        run: rustc -V && cargo -V && cargo clippy -V
+      - name: clippy
+        run: cargo clippy --locked --target ${{ matrix.target }} --all-targets -- -D warnings
+      - name: rustdoc (intra-doc link gate)
+        run: cargo doc --locked --target ${{ matrix.target }} --no-deps --document-private-items
+
+  # The unit suite, run natively per OS/arch in both profiles. macOS exercises the cfg(macos) BSD path; the
+  # two Linux arches exercise cfg(linux) on 64-bit (cross-test runs the 32-bit arm targets under QEMU).
+  # Privileged tests (raw-socket capture) self-skip without CAP_NET_RAW, as they do on the dev host -- no
+  # sudo needed.
+  test:
+    name: Test (${{ matrix.target.name }}, ${{ matrix.profile.name }})
+    needs: gate
+    if: ${{ !cancelled() && (needs.gate.result != 'success' || needs.gate.outputs.run == 'true') }}
+    runs-on: ${{ matrix.target.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both profiles: the shipped binary is release (overflow checks off, debug_assert! compiled
+        # out, LTO) while debug keeps them on, so a test can pass under one and not the other.
+        profile:
+          - { name: debug, flag: '' }
+          - { name: release, flag: '--release' }
+        target:
+          - { name: linux-amd64, runner: ubuntu-24.04 }
+          - { name: linux-arm64, runner: ubuntu-24.04-arm }
+          - { name: macos-arm64, runner: macos-15 }
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+      - name: Cache cargo build
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-${{ matrix.target.name }}-${{ matrix.profile.name }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ matrix.target.name }}-${{ matrix.profile.name }}-
+      - name: Show toolchain
+        run: rustc -V && cargo -V
+      - name: cargo test
+        run: cargo test --locked ${{ matrix.profile.flag }}
+
+  # armv7/armv5 have no native runner, but 32-bit ARM is a deployment target (MikroTik), so run the suite
+  # under QEMU rather than only cross-building it -- this catches pointer-width / alignment / cast bugs the
+  # 64-bit lanes can't. The static musl test binary needs no target sysroot under qemu-user: lld cross-links
+  # it (the same config the Dockerfile uses, no per-arch gcc), and the cargo target runner executes it via
+  # qemu-arm-static. armv7 = armhf (hard-float, musleabihf); armv5 = armel (soft-float, the EN7562 boxes).
+  cross-test:
+    name: Test (${{ matrix.target.name }}, ${{ matrix.profile.name }})
+    needs: gate
+    if: ${{ !cancelled() && (needs.gate.result != 'success' || needs.gate.outputs.run == 'true') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        profile:
+          - { name: debug, flag: '' }
+          - { name: release, flag: '--release' }
+        target:
+          - { name: linux-armv7, triple: armv7-unknown-linux-musleabihf }
+          - { name: linux-armv5, triple: arm-unknown-linux-musleabi }
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+      - name: Install lld + QEMU user-mode
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends lld qemu-user-static
+      - name: Add the Rust target
+        run: rustup target add ${{ matrix.target.triple }}
+      - name: Cache cargo build
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-${{ matrix.target.triple }}-${{ matrix.profile.name }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ matrix.target.triple }}-${{ matrix.profile.name }}-
+      # Link the musl target with lld (cross-capable, unlike the host gcc) and run the test binary under
+      # QEMU -- the same lld config the Dockerfile writes, plus a per-target qemu-arm-static runner. The
+      # cfg(target_env = "musl") scope leaves host build-scripts/proc-macros on the default linker.
+      - name: Configure the cross linker and QEMU runner
+        run: |
+          mkdir -p .cargo
+          cat > .cargo/config.toml <<'EOF'
+          [target.'cfg(target_env = "musl")']
+          linker = "ld.lld"
+          rustflags = ["-C", "linker-flavor=ld.lld"]
+
+          [target.armv7-unknown-linux-musleabihf]
+          runner = "qemu-arm-static"
+
+          [target.arm-unknown-linux-musleabi]
+          runner = "qemu-arm-static"
+          EOF
+      - name: Show toolchain
+        run: rustc -V && cargo -V
+      - name: cargo test (under QEMU)
+        run: cargo test --locked --target ${{ matrix.target.triple }} ${{ matrix.profile.flag }}
+
+  # FreeBSD shares its BSD platform path (kqueue, BPF, route sockets, getifaddrs) with macOS but needs a real
+  # FreeBSD kernel to build and run -- Docker can't provide one. vmactions boots a FreeBSD VM (KVM on the
+  # amd64 runner) and runs the suite there. The VM runs as root, so privileged tests run instead of skipping;
+  # each self-skips where its operation isn't available. One profile per VM boot, in parallel lanes -- the
+  # same debug/release split as the native test lanes. (Arm release IMAGES aren't built here; cross-test
+  # cross-compiles the arm code, docker-e2e exercises the Dockerfile on amd64, and release.yml builds the
+  # multi-arch images -- so a separate arm image-build gate adds little.)
+  freebsd:
+    name: Test (freebsd-amd64, ${{ matrix.profile.name }})
+    needs: gate
+    if: ${{ !cancelled() && (needs.gate.result != 'success' || needs.gate.outputs.run == 'true') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        profile:
+          - { name: debug, flag: '' }
+          - { name: release, flag: '--release' }
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+      - name: Build and test in a FreeBSD VM
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: '14.2'
+          usesh: true
+          prepare: |
+            pkg install -y rust
+          run: |
+            rustc --version
+            cargo --version
+            cargo test --locked ${{ matrix.profile.flag }}
+
+  # Build the scratch image and drive the Docker-bridge e2e suite (the data path: capture -> reflect across
+  # two bridges, multi-protocol). --skip-build reuses the image built here with the gha cache.
+  docker-e2e:
+    name: Docker e2e
+    needs: gate
+    if: ${{ !cancelled() && (needs.gate.result != 'success' || needs.gate.outputs.run == 'true') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+      - name: Build reflector image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          tags: reflector:e2e
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Run e2e
+        run: python3 e2e/run.py --skip-build --image reflector:e2e
