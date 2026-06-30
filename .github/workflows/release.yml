@@ -119,9 +119,11 @@ jobs:
       - name: Verify static linking (Linux)
         if: runner.os == 'Linux'
         run: |
-          file "dist/reflector-${{ github.ref_name }}-${{ matrix.variant }}"
-          file "dist/reflector-${{ github.ref_name }}-${{ matrix.variant }}" | grep -q 'statically linked' \
-            || { echo "::error::binary is not statically linked"; exit 1; }
+          bin="dist/reflector-${{ github.ref_name }}-${{ matrix.variant }}"
+          file "$bin"
+          # musl's +crt-static yields a static-pie binary: static (no shared libs) but PIE for ASLR.
+          file "$bin" | grep -q 'static-pie linked' \
+            || { echo "::error::binary is not static-pie linked"; exit 1; }
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@v7
@@ -160,12 +162,18 @@ jobs:
           prepare: |
             pkg install -y rust
           run: |
-            RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --locked
-            file target/release/reflector
-            file target/release/reflector | grep -q 'statically linked' \
+            # --target (even ==host) splits the host proc-macro/build-script graph from the target
+            # graph, so +crt-static lands only on the binary; without it the flag breaks proc-macros.
+            RUSTFLAGS="-C target-feature=+crt-static" \
+              cargo build --release --locked --target ${{ matrix.vm_arch }}-unknown-freebsd
+            bin="target/${{ matrix.vm_arch }}-unknown-freebsd/release/reflector"
+            file "$bin"
+            # FreeBSD's +crt-static yields a plain (non-PIE) static binary -- no shared libs, so one
+            # binary runs across FreeBSD majors.
+            file "$bin" | grep -q 'statically linked' \
               || { echo "::error::freebsd binary is not statically linked"; exit 1; }
             mkdir -p dist
-            cp target/release/reflector "dist/reflector-${{ github.ref_name }}-freebsd-${{ matrix.arch }}"
+            cp "$bin" "dist/reflector-${{ github.ref_name }}-freebsd-${{ matrix.arch }}"
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@v7
