@@ -152,4 +152,43 @@ mod tests {
         let mac = MacAddr::multicast_for(IpAddr::V6(Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0xfb)));
         assert_eq!(mac.octets(), [0x33, 0x33, 0x00, 0x00, 0x00, 0xfb]);
     }
+
+    #[test]
+    fn ipv6_multicast_maps_the_low_32_bits() {
+        // Distinct bytes 12..16 pin the mapping (ff02::fb alone can't).
+        let mac = MacAddr::multicast_for(IpAddr::V6(Ipv6Addr::new(
+            0xff02, 0, 0, 0, 0, 0, 0xdead, 0xbeef,
+        )));
+        assert_eq!(mac.octets(), [0x33, 0x33, 0xde, 0xad, 0xbe, 0xef]);
+    }
+
+    #[test]
+    #[cfg_attr(
+        not(debug_assertions),
+        ignore = "multicast_for's guard is a debug_assert!, compiled out in release"
+    )]
+    #[should_panic(expected = "multicast_for requires a multicast address")]
+    fn multicast_for_panics_on_a_non_multicast_address() {
+        let _ = MacAddr::multicast_for(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)));
+    }
+
+    #[test]
+    fn from_str_rejects_malformed() {
+        for s in [
+            "",
+            "01:02:03",             // too few
+            "01:02:03:04:05:06:07", // too many
+            "1:2:3:4:5:6",          // one-digit octets
+            "100:02:03:04:05:06",   // three-digit octet
+            "01::03:04:05:06",      // empty octet
+        ] {
+            assert_eq!(s.parse::<MacAddr>(), Err(ParseMacAddrError), "{s:?}");
+        }
+    }
+
+    #[test]
+    fn mac_display_zero_pads_octets() {
+        let mac = MacAddr::from([0x01, 0x02, 0x03, 0x04, 0x05, 0x0a]);
+        assert_eq!(mac.to_string(), "01:02:03:04:05:0a");
+    }
 }
