@@ -154,6 +154,9 @@ class TestCase:
     # Also require the reflected packet's source to be routable (non-link-local) — the per-scope v6
     # source selection: a site-local group (ff05::c) must not be sourced from a link-local address.
     expect_routable_source: bool = False
+    # Reflector config file (relative to e2e/) mounted into the reflector container. Most cases share
+    # config.toml; a case needing a distinct reflector set (e.g. single-family) names its own.
+    config: str = "config.toml"
 
     @property
     def send_address(self) -> str:
@@ -309,6 +312,33 @@ MDNS_CASES = [
         group=MDNS_GROUP_V4,
         direction="forward",
     ),
+    # Single-family gating (address_family = "ipv4"): the reflector reflects v4 mDNS but never joins
+    # the v6 group or registers a v6 handler, so v6 is ignored. The v4 case is the positive control —
+    # it proves the reflector is live, so the v6 expect-none is a real "gated out", not a dead reflector.
+    TestCase(
+        name="ipv4_only_reflector_reflects_mdns_query",
+        config="config-family.toml",
+        send_port=MDNS_PORT,
+        receive_port=MDNS_PORT,
+        expect_mac=None,
+        timeout_seconds=5.0,
+        send_payload_hex=MDNS_QUERY_HEX,
+        expect_payload_hex=MDNS_QUERY_HEX,
+        group=MDNS_GROUP_V4,
+        direction="forward",
+    ),
+    TestCase(
+        name="ipv4_only_reflector_ignores_mdns_query_ipv6",
+        config="config-family.toml",
+        send_port=MDNS_PORT,
+        receive_port=MDNS_PORT,
+        expect_mac=None,
+        timeout_seconds=2.0,
+        send_payload_hex=MDNS_QUERY_HEX,
+        group=MDNS_GROUP_V6,
+        family=6,
+        direction="forward",
+    ),
 ]
 
 # SSDP one-way reflection is directional: M-SEARCH searches relay source->target ("forward"), NOTIFY
@@ -424,6 +454,33 @@ SSDP_CASES = [
         send_payload_hex=SSDP_MSEARCH_HEX,
         group=SSDP_GROUP_V4,
         direction="forward",
+    ),
+    # Single-family gating, the IPv6 mirror of the IPv4-only mDNS cases (a different protocol on
+    # purpose): an address_family = "ipv6" SSDP reflector reflects v6 NOTIFY but never joins the v4
+    # group or registers a v4 handler, so v4 is ignored. The v6 case is the positive control.
+    TestCase(
+        name="ipv6_only_reflector_reflects_ssdp_notify",
+        config="config-family-v6.toml",
+        send_port=SSDP_PORT,
+        receive_port=SSDP_PORT,
+        expect_mac=None,
+        timeout_seconds=5.0,
+        send_payload_hex=SSDP_NOTIFY_HEX,
+        expect_payload_hex=SSDP_NOTIFY_HEX,
+        group=SSDP_GROUP_V6,
+        family=6,
+        direction="reverse",
+    ),
+    TestCase(
+        name="ipv6_only_reflector_ignores_ssdp_notify_ipv4",
+        config="config-family-v6.toml",
+        send_port=SSDP_PORT,
+        receive_port=SSDP_PORT,
+        expect_mac=None,
+        timeout_seconds=2.0,
+        send_payload_hex=SSDP_NOTIFY_HEX,
+        group=SSDP_GROUP_V4,
+        direction="reverse",
     ),
 ]
 
@@ -594,7 +651,7 @@ class DockerE2E:
         self.sender_container = f"{self.prefix}-sender"
         self.containers = [self.sender_container, self.receiver_container, self.reflector_container]
         self.networks = [self.source_network, self.target_network]
-        self.config_path = E2E_DIR / "config.toml"
+        self.config_path = E2E_DIR / case.config
 
         self._select_direction(case.direction)
 

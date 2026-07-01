@@ -1,0 +1,11 @@
+log_level = "debug"
+
+# An IPv6-only SSDP reflector (address_family = "ipv6"), the mirror of config-family.toml's IPv4-only
+# mDNS reflector: it reflects v6 SSDP but never joins the v4 group or registers a v4 handler, so v4 SSDP
+# is ignored. A lone reflector so it can't conflict with the dual "discovery" one in config.toml.
+# (Different protocol from the IPv4 case on purpose, so single-family gating is covered for both.)
+[reflectors.ssdp-v6]
+source_if = "wol_src"
+target_if = "wol_dst"
+ssdp = true
+address_family = "ipv6"

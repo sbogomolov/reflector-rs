@@ -1,0 +1,11 @@
+log_level = "debug"
+
+# An IPv4-only mDNS reflector (address_family = "ipv4"), for the single-family gating cases: it
+# reflects v4 mDNS but never joins the v6 group or registers a v6 handler, so v6 mDNS is ignored.
+# A lone reflector (not sharing the interfaces with the dual "discovery" one in config.toml) so the
+# two mDNS reflectors can't conflict.
+[reflectors.mdns-v4]
+source_if = "wol_src"
+target_if = "wol_dst"
+mdns = true
+address_family = "ipv4"
