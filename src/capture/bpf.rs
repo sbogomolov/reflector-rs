@@ -417,6 +417,17 @@ mod tests {
         assert!(parse_record(&batch).is_err());
     }
 
+    #[test]
+    fn rejects_a_frame_extending_past_the_batch() {
+        // A header whose bh_caplen claims more frame bytes than the batch holds.
+        let hdrlen = u16::try_from(size_of::<libc::bpf_hdr>()).unwrap();
+        let mut batch = vec![0u8; size_of::<libc::bpf_hdr>() + 2];
+        batch[offset_of!(libc::bpf_hdr, bh_hdrlen)..][..2].copy_from_slice(&hdrlen.to_ne_bytes());
+        batch[offset_of!(libc::bpf_hdr, bh_caplen)..][..4].copy_from_slice(&100u32.to_ne_bytes());
+        batch[offset_of!(libc::bpf_hdr, bh_datalen)..][..4].copy_from_slice(&100u32.to_ne_bytes());
+        assert!(parse_record(&batch).is_err());
+    }
+
     /// Send a UDP probe to `bind` (a v4 or v6 loopback address) and confirm the BPF
     /// backend captures it as a `DLT_NULL` frame: a 4-byte host-order `family`, then
     /// an IP header whose version nibble is `version` (so the link header is exactly

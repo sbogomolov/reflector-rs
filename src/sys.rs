@@ -210,4 +210,24 @@ mod tests {
         assert_eq!(sin6.sin6_addr.s6_addr, v6.octets());
         assert_eq!(sin6.sin6_scope_id, 7);
     }
+
+    #[test]
+    fn would_block_matches_only_eagain_and_ewouldblock() {
+        assert!(would_block(&io::Error::from_raw_os_error(libc::EAGAIN)));
+        assert!(would_block(&io::Error::from_raw_os_error(
+            libc::EWOULDBLOCK
+        )));
+        assert!(!would_block(&io::Error::from_raw_os_error(libc::EPERM)));
+    }
+
+    #[test]
+    fn from_syscall_maps_a_nonnegative_count_to_ready() {
+        assert!(matches!(IoStatus::from_syscall(0), Ok(IoStatus::Ready(0))));
+        assert!(matches!(IoStatus::from_syscall(7), Ok(IoStatus::Ready(7))));
+    }
+
+    #[test]
+    fn owned_fd_from_rejects_a_negative_return() {
+        assert!(owned_fd_from(-1).is_err());
+    }
 }
