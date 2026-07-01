@@ -130,4 +130,13 @@ mod tests {
         for_each_change(&buf, &mut |i| seen.push(i));
         assert!(seen.is_empty());
     }
+
+    #[test]
+    fn stops_at_a_message_claiming_a_length_past_the_buffer() {
+        let mut buf = message(libc::RTM_NEWADDR, 7, 20);
+        buf[0..2].copy_from_slice(&9999u16.to_ne_bytes()); // msglen past the datagram
+        let mut seen = Vec::new();
+        for_each_change(&buf, &mut |i| seen.push(i));
+        assert!(seen.is_empty());
+    }
 }
