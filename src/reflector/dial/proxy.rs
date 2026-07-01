@@ -394,7 +394,7 @@ mod tests {
         let mut closed = false;
         for _ in 0..2000 {
             proxy.accept_rest(&mut reactor);
-            if matches!(client.recv(&mut buf), Ok(IoStatus::Ready(0))) {
+            if matches!(client.recv_bytes(&mut buf), Ok(IoStatus::Ready(0))) {
                 closed = true;
                 break;
             }
