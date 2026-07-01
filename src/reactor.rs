@@ -125,6 +125,10 @@ struct Registration {
 pub(crate) struct Reactor {
     handlers: Arena<HandlerEntry>,
     registrations: Arena<Registration>,
+    /// Reused across deadline sweeps: the due handlers' keys, snapshotted so a handler firing
+    /// mid-sweep can touch the reactor without the buffer aliasing `&mut self`. Kept allocated so a
+    /// sweep doesn't allocate.
+    deadline_keys: Vec<Key>,
     poll: Poller,
     shutdown: bool,
 }
@@ -138,6 +142,7 @@ impl Reactor {
         Ok(Self {
             handlers: Arena::new(),
             registrations: Arena::new(),
+            deadline_keys: Vec::new(),
             poll: Poller::new(EVENT_CAPACITY)?,
             shutdown: false,
         })
@@ -400,19 +405,26 @@ impl Reactor {
     /// is taken out for its call (as in [`dispatch`](Self::dispatch)) so it can touch the reactor;
     /// one that removes itself mid-call is simply not restored.
     fn dispatch_deadlines(&mut self, now: Instant) {
-        let due: Vec<Key> = self
-            .handlers
-            .iter()
-            .filter(|(_, entry)| {
-                entry
-                    .handler
-                    .as_ref()
-                    .and_then(|h| h.next_deadline())
-                    .is_some_and(|d| d <= now)
-            })
-            .map(|(key, _)| key)
-            .collect();
-        for key in due {
+        // Snapshot the due handlers into the reused buffer, then fire them with the same take-and-
+        // restore as `dispatch` so each can touch the reactor. Indexing by `Key` (Copy) drops the
+        // buffer borrow before the `&mut self` call; a handler that removes itself (or another due
+        // handler) mid-sweep leaves a stale key, and the `get_mut` miss makes take and restore no-ops.
+        // Deadline sweeps never nest, so one shared buffer suffices.
+        self.deadline_keys.clear();
+        self.deadline_keys.extend(
+            self.handlers
+                .iter()
+                .filter(|(_, entry)| {
+                    entry
+                        .handler
+                        .as_ref()
+                        .and_then(|h| h.next_deadline())
+                        .is_some_and(|d| d <= now)
+                })
+                .map(|(key, _)| key),
+        );
+        for i in 0..self.deadline_keys.len() {
+            let key = self.deadline_keys[i];
             // Gone if an earlier sweep in this pass removed it (its key went stale) — benign.
             let Some(mut handler) = self
                 .handlers
