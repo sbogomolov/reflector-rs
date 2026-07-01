@@ -278,4 +278,25 @@ mod tests {
         );
         Ok(())
     }
+
+    #[test]
+    fn find_or_add_interface_dedups_by_name() -> io::Result<()> {
+        let mut table = InterfaceTable::new();
+        let first = table.find_or_add_interface(LOOPBACK_IFACE)?;
+        let second = table.find_or_add_interface(LOOPBACK_IFACE)?;
+        assert_eq!(first, second, "the same name resolves to one interface key");
+        Ok(())
+    }
+
+    #[test]
+    fn capture_accessors_reject_an_out_of_range_key() {
+        let mut table = InterfaceTable::new();
+        let forged = CaptureKey(0); // nothing added yet
+        assert!(!table.contains(forged));
+        assert!(table.interface_of(forged).is_none());
+        assert!(table.ifindex_of(forged).is_none());
+        assert!(table.capture(forged).is_none());
+        assert!(table.egress_addrs(forged).is_none());
+        assert!(table.take(forged).is_none());
+    }
 }

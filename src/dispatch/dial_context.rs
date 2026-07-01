@@ -185,4 +185,67 @@ mod tests {
                 .map(|p| p.desc_grace)
         }
     }
+
+    use std::time::Duration;
+
+    use crate::reactor::{Handler, ReadyEvent};
+
+    struct Dummy;
+    impl Handler for Dummy {
+        fn on_readable(&mut self, _event: ReadyEvent, _reactor: &mut Reactor) {}
+    }
+
+    fn ep(n: u8) -> SocketAddrV4 {
+        SocketAddrV4::new(std::net::Ipv4Addr::new(10, 0, 0, n), 8008)
+    }
+
+    #[test]
+    fn next_grace_reports_the_soonest_or_none_when_empty() {
+        let mut reactor = Reactor::new().unwrap();
+        let mut ctx = DialContext::new();
+        assert_eq!(ctx.next_grace(), None);
+
+        let base = Instant::now();
+        let hk1 = reactor.register(Box::new(Dummy));
+        ctx.insert(
+            CaptureKey(0),
+            CaptureKey(1),
+            ep(1),
+            hk1,
+            ep(9),
+            base + Duration::from_secs(10),
+        );
+        let hk2 = reactor.register(Box::new(Dummy));
+        ctx.insert(
+            CaptureKey(0),
+            CaptureKey(1),
+            ep(2),
+            hk2,
+            ep(9),
+            base + Duration::from_secs(5),
+        );
+        assert_eq!(ctx.next_grace(), Some(base + Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn lookup_finds_a_live_proxy_and_prunes_an_evicted_one() {
+        let mut reactor = Reactor::new().unwrap();
+        let mut ctx = DialContext::new();
+        let hk = reactor.register(Box::new(Dummy));
+        let base = Instant::now();
+        ctx.insert(CaptureKey(0), CaptureKey(1), ep(1), hk, ep(9), base);
+
+        // Live: found, and its grace is refreshed to the new deadline.
+        let refreshed = base + Duration::from_secs(30);
+        assert_eq!(
+            ctx.lookup(CaptureKey(0), ep(1), &reactor, refreshed),
+            Some(ep(9))
+        );
+        assert_eq!(ctx.grace_of(CaptureKey(0), ep(1)), Some(refreshed));
+
+        // Evicted: the stale entry is pruned and reported absent.
+        reactor.unregister(hk).unwrap();
+        assert_eq!(ctx.lookup(CaptureKey(0), ep(1), &reactor, base), None);
+        assert_eq!(ctx.proxy_count(), 0);
+    }
 }
