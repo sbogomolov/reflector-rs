@@ -173,4 +173,10 @@ mod tests {
             None // non-numeric
         );
     }
+
+    #[test]
+    fn empty_location_value_is_none() {
+        assert!(parse_dial_location_authority(b"NOTIFY * HTTP/1.1\r\nLOCATION:\r\n\r\n").is_none());
+        assert!(dial_location_value(b"NOTIFY * HTTP/1.1\r\nLOCATION:   \r\n\r\n").is_none());
+    }
 }

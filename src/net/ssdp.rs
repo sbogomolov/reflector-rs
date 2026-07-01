@@ -162,4 +162,13 @@ mod tests {
             None
         );
     }
+
+    #[test]
+    fn mx_reads_leading_digits_then_rejects_u32_overflow() {
+        // A trailing non-digit doesn't void a valid leading number.
+        assert_eq!(parse_msearch_mx(&msearch("3 seconds")), Some(3));
+        assert_eq!(parse_msearch_mx(&msearch("2x")), Some(2));
+        // Too large for u32 is present-but-unparseable (None), not clamped to 5 like a large-but-fits value.
+        assert_eq!(parse_msearch_mx(&msearch("99999999999999")), None);
+    }
 }
