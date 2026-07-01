@@ -329,4 +329,76 @@ mod tests {
             assert_eq!(Key::from_u64(key.to_u64()), key);
         }
     }
+
+    #[test]
+    fn remove_with_a_stale_key_spares_the_reused_slots_occupant() {
+        let mut arena = Arena::new();
+        let a = arena.insert("a");
+        arena.remove(a);
+        let b = arena.insert("b");
+        assert_eq!(a.index, b.index);
+        assert_eq!(arena.remove(a), None);
+        assert_eq!(arena.get(b), Some(&"b"));
+        assert!(arena.contains(b));
+    }
+
+    #[test]
+    fn removing_a_stale_key_does_not_double_free() {
+        let mut arena = Arena::new();
+        let a = arena.insert("a");
+        arena.remove(a);
+        assert_eq!(arena.remove(a), None);
+        let b = arena.insert("b");
+        let c = arena.insert("c");
+        assert_ne!(
+            b.index, c.index,
+            "a double-freed slot would be handed out twice"
+        );
+        assert_eq!(arena.get(b), Some(&"b"));
+        assert_eq!(arena.get(c), Some(&"c"));
+    }
+
+    #[test]
+    fn get_mut_misses_on_out_of_range_wrong_generation_and_removed_keys() {
+        let mut arena = Arena::new();
+        let key = arena.insert(1);
+
+        let out_of_range = Key {
+            index: 999,
+            generation: 0,
+        };
+        assert!(arena.get_mut(out_of_range).is_none());
+
+        let wrong_generation = Key {
+            index: key.index,
+            generation: key.generation.wrapping_add(1),
+        };
+        assert!(arena.get_mut(wrong_generation).is_none());
+
+        arena.remove(key);
+        assert!(arena.get_mut(key).is_none());
+    }
+
+    #[test]
+    fn insert_reuses_freed_slots_before_growing() {
+        let mut arena = Arena::new();
+        let freed_lo = arena.insert("lo");
+        let freed_hi = arena.insert("hi");
+        arena.remove(freed_lo);
+        arena.remove(freed_hi);
+        let reused_a = arena.insert("a");
+        let reused_b = arena.insert("b");
+        assert!(reused_a.index == freed_lo.index || reused_a.index == freed_hi.index);
+        assert!(reused_b.index == freed_lo.index || reused_b.index == freed_hi.index);
+        assert_ne!(reused_a.index, reused_b.index);
+        let grown = arena.insert("grown");
+        assert_ne!(grown.index, freed_lo.index);
+        assert_ne!(grown.index, freed_hi.index);
+    }
+
+    #[test]
+    fn iter_on_an_empty_arena_yields_nothing() {
+        let arena: Arena<i32> = Arena::new();
+        assert_eq!(arena.iter().count(), 0);
+    }
 }
