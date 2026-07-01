@@ -749,4 +749,43 @@ mod tests {
             Err(FramingError::MalformedChunkSize)
         ));
     }
+
+    #[test]
+    fn chunk_extensions_are_dropped_from_the_size() {
+        let mut f = HttpFraming::new(Kind::Response, RewritePolicy::NONE);
+        let msgs = drain(
+            &mut f,
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5;name=value\r\nhello\r\n0\r\n\r\n",
+        );
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].1, b"5;name=value\r\nhello\r\n0\r\n\r\n");
+    }
+
+    #[test]
+    fn chunked_takes_precedence_over_content_length() {
+        let mut f = HttpFraming::new(Kind::Response, RewritePolicy::NONE);
+        f.scan_and_rewrite_header(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nTransfer-Encoding: chunked\r\n\r\n",
+        )
+        .unwrap();
+        assert_eq!(f.phase, Phase::BodyChunked);
+    }
+
+    #[test]
+    fn streams_a_chunked_body_across_feeds() {
+        let mut f = HttpFraming::new(Kind::Response, RewritePolicy::NONE);
+        // First feed: header, the chunk-size line, and only part of the chunk data.
+        let first = f
+            .feed(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhel")
+            .unwrap();
+        assert_eq!(
+            first.header,
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+        );
+        assert_eq!(first.body, b"5\r\nhel");
+        // Second feed: the rest of the chunk (data + CRLF) then the terminating chunk.
+        let second = f.feed(b"lo\r\n0\r\n\r\n").unwrap();
+        assert_eq!(second.header, b"");
+        assert_eq!(second.body, b"lo\r\n0\r\n\r\n");
+    }
 }
