@@ -80,6 +80,19 @@ mod tests {
     }
 
     #[test]
+    fn authority_terminates_at_space_or_cr() {
+        let a = parse_authority(b"http://10.0.0.7:8080 HTTP/1.1", false).unwrap();
+        assert_eq!(a.endpoint, "10.0.0.7:8080".parse().unwrap());
+        assert_eq!(a.len, "10.0.0.7:8080".len());
+        assert_eq!(
+            parse_authority(b"http://10.0.0.7\r", false)
+                .unwrap()
+                .endpoint,
+            "10.0.0.7:80".parse().unwrap()
+        );
+    }
+
+    #[test]
     fn parse_authority_handles_a_bare_host_value() {
         let a = parse_authority(b"192.168.1.5:1900", true).unwrap();
         assert_eq!(a.endpoint, "192.168.1.5:1900".parse().unwrap());
