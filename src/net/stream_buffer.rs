@@ -224,6 +224,16 @@ mod tests {
     }
 
     #[test]
+    fn append_of_empty_data_is_a_noop() {
+        let mut b = StreamBuffer::with_capacity(4);
+        b.append(b"").unwrap();
+        assert!(b.is_empty());
+        b.append(b"ab").unwrap();
+        b.append(b"").unwrap();
+        assert_eq!(b.pending(), b"ab");
+    }
+
+    #[test]
     fn free_tail_mut_offers_the_spare_capacity_and_commit_fills_it() {
         let mut b = StreamBuffer::with_capacity(8);
         b.append(b"ab").unwrap();
