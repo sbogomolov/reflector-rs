@@ -232,6 +232,9 @@ mod tests {
         let n = unsafe { libc::read(pipe.read_fd(), buf.as_mut_ptr().cast(), buf.len()) };
         assert!(n >= 1);
 
+        // A second install while the first guard holds the write fd is refused.
+        assert!(ShutdownPipe::install().is_err());
+
         drop(guard); // restores the previous SIGINT/SIGTERM dispositions
     }
 }
