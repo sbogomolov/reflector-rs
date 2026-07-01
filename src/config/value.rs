@@ -346,4 +346,23 @@ mod tests {
             [7, 9]
         );
     }
+
+    #[test]
+    fn address_family_parses_via_fromstr() {
+        use AddressFamily as F;
+        assert_eq!("default".parse::<F>().unwrap(), F::Default);
+        assert_eq!("DUAL".parse::<F>().unwrap(), F::Dual);
+        assert_eq!("ipv4".parse::<F>().unwrap(), F::Ipv4);
+        assert_eq!("IPv6".parse::<F>().unwrap(), F::Ipv6);
+        assert_eq!("both".parse::<F>(), Err(ParseAddressFamilyError));
+    }
+
+    #[test]
+    fn wol_ports_reject_an_empty_list() {
+        // FromStr can't yield an empty list, so Empty is reachable only via the TryFrom path.
+        assert!(matches!(
+            WolPorts::try_from(Vec::<NonZeroU16>::new()),
+            Err(WolPortsError::Empty)
+        ));
+    }
 }
