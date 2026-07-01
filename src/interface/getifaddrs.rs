@@ -181,23 +181,20 @@ struct In6Ifreq {
 union In6Ifru {
     addr: libc::sockaddr_in6,
     flags6: c_int,
-    // The kernel's `in6_ifreq` union is sized by its largest member, `icmp6_ifstat` (34
-    // `u_quad_t` on macOS, 48 on FreeBSD). This pad makes the whole struct match — load-
+    // The kernel's `in6_ifreq` union is sized by its largest member, `icmp6_ifstat` — 34
+    // `u_quad_t` on both macOS and FreeBSD. This pad makes the whole struct match — load-
     // bearing: `_IOWR` bakes `sizeof(in6_ifreq)` into the request code and the kernel
     // dispatches on the whole code, so a too-small struct yields a request the kernel
     // rejects, and every v6 address would be silently dropped. See the size assertions.
-    #[cfg(target_os = "macos")]
     _icmp6_ifstat: [u64; 34],
-    #[cfg(target_os = "freebsd")]
-    _icmp6_ifstat: [u64; 48],
 }
 
 // `libc` exposes `in6_ifreq` on macOS, so cross-check the hand-rolled size against it
-// there; FreeBSD's (16 + 48×8) is 400.
+// there; FreeBSD's (16 + 34×8) is 288.
 #[cfg(target_os = "macos")]
 const _: () = assert!(size_of::<In6Ifreq>() == size_of::<libc::in6_ifreq>());
 #[cfg(target_os = "freebsd")]
-const _: () = assert!(size_of::<In6Ifreq>() == 400);
+const _: () = assert!(size_of::<In6Ifreq>() == 288);
 
 /// `_IOWR('i', 73, in6_ifreq)` — the BSD `ioctl` request code, derived from the (now
 /// kernel-accurate) struct size rather than hardcoded.
@@ -238,9 +235,7 @@ mod tests {
     // (omitting the large union members) is exactly how that regresses.
     #[test]
     fn siocgifaflag_in6_is_the_kernel_request_code() {
-        #[cfg(target_os = "macos")]
+        // Identical on macOS and FreeBSD: both size `in6_ifreq` at 288 bytes.
         assert_eq!(siocgifaflag_in6(), 0xc120_6949);
-        #[cfg(target_os = "freebsd")]
-        assert_eq!(siocgifaflag_in6(), 0xc190_6949);
     }
 }
