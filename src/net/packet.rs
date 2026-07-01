@@ -505,4 +505,34 @@ mod tests {
             Err(ParseError::BadLength)
         );
     }
+
+    #[test]
+    fn rejects_udp_length_below_minimum() {
+        let mut buf = [0u8; 64];
+        let n = valid_ethernet_ipv4(&mut buf);
+        buf[38..40].copy_from_slice(&4u16.to_be_bytes()); // UDP length below the 8-byte header
+        assert_eq!(
+            Packet::parse(LinkType::Ethernet, &buf[..n]),
+            Err(ParseError::BadLength)
+        );
+    }
+
+    #[test]
+    fn rejects_l4_region_smaller_than_the_udp_header() {
+        let mut buf = [0u8; 64];
+        let n = valid_ethernet_ipv4(&mut buf);
+        buf[16..18].copy_from_slice(&24u16.to_be_bytes()); // total length leaves 4 bytes for L4
+        assert_eq!(
+            Packet::parse(LinkType::Ethernet, &buf[..n]),
+            Err(ParseError::Truncated)
+        );
+    }
+
+    #[test]
+    fn rejects_ethernet_frame_with_no_l3_bytes() {
+        assert_eq!(
+            Packet::parse(LinkType::Ethernet, &[0u8; ETHERNET_HEADER_SIZE]),
+            Err(ParseError::Truncated)
+        );
+    }
 }
