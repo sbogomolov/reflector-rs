@@ -908,6 +908,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn watch_on_a_stale_handler_errors() {
+        let mut reactor = Reactor::new().unwrap();
+        let (a, _pa) = pair();
+        let hk = reactor.register(TestHandler::read(a, |_, _| {}));
+        assert!(reactor.unregister(hk).unwrap());
+        // A live fd, so the rejection is due to the stale handler key, not a bad fd.
+        let (b, _pb) = pair();
+        assert!(reactor.watch(hk, b.as_raw_fd(), 0).is_err());
+    }
+
+    #[test]
+    fn watch_failure_errors_and_leaves_the_handler_usable() {
+        let mut reactor = Reactor::new().unwrap();
+        let (a, _pa) = pair();
+        let hk = reactor.register(TestHandler::read(a, |_, _| {}));
+        // A closed (but non-negative) fd fails the kernel add; nothing allocates an fd between the
+        // close and the watch, so the number isn't reused.
+        let closed = {
+            let (c, _pc) = pair();
+            c.as_raw_fd()
+        };
+        assert!(reactor.watch(hk, closed, 0).is_err());
+        // The handler is intact and can still watch a good fd afterward.
+        assert!(reactor.is_registered(hk));
+        let (b, _pb) = pair();
+        assert!(reactor.watch(hk, b.as_raw_fd(), 0).is_ok());
+    }
+
+    #[test]
+    fn setting_interest_on_a_stale_reg_is_a_benign_false() {
+        let mut reactor = Reactor::new().unwrap();
+        let (a, _peer) = pair();
+        let raw = a.as_raw_fd();
+        let (hk, rk) = watch1(&mut reactor, TestHandler::read(a, |_, _| {}), raw);
+        assert!(reactor.unwatch(rk).unwrap());
+        assert!(!reactor.set_write_interest(rk, true).unwrap());
+        assert!(!reactor.set_read_interest(rk, true).unwrap());
+        assert!(reactor.is_registered(hk)); // the handler itself is untouched
+    }
+
     /// A handler with no fd that only carries a timer: it reports `deadline` and runs `on_fire`
     /// when the reactor sweeps it. Lets the deadline path be tested without a real clock or fds.
     struct TimerHandler {
