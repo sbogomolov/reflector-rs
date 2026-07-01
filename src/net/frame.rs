@@ -475,6 +475,31 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn ethernet_payload_too_large_passes_through_unchanged() {
+        let mac = MacAddr::broadcast();
+        let src = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1);
+        let dst = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 2);
+        let payload = vec![0u8; 65_508];
+        let mut buf = [0u8; 64];
+        // PayloadTooLarge is not rebased onto the L2 header, unlike BufferTooSmall.
+        assert!(matches!(
+            ethernet_ipv4_udp(mac, mac, src, dst, 1, &payload, &mut buf),
+            Err(FrameError::PayloadTooLarge { payload: 65_508 })
+        ));
+    }
+
+    #[test]
+    fn frame_fits_a_buffer_sized_exactly() {
+        let src = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1);
+        let dst = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 2);
+        let mut buf = [0u8; IPV4_HEADER_SIZE + UDP_HEADER_SIZE]; // exactly the empty-payload frame
+        assert_eq!(
+            ipv4_udp(src, dst, 1, &[], &mut buf),
+            Ok(IPV4_HEADER_SIZE + UDP_HEADER_SIZE)
+        );
+    }
+
     #[cfg(any(target_os = "macos", target_os = "freebsd"))]
     #[test]
     fn dlt_null_ipv4_frame_prefixes_the_host_family() {
