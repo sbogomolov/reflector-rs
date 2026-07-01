@@ -332,3 +332,146 @@ fn scan_link(msg: &[u8], if_name: &str, ifindex: u32, addrs: &mut InterfaceAddre
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Serialize `[len:u16][type:u16][value]` rtattr TLVs, each padded to 4 bytes, onto `buf`.
+    fn push_attrs(buf: &mut Vec<u8>, attrs: &[(u16, &[u8])]) {
+        for &(attr_type, value) in attrs {
+            let len = u16::try_from(size_of::<RtAttr>() + value.len()).unwrap();
+            buf.extend_from_slice(&len.to_ne_bytes());
+            buf.extend_from_slice(&attr_type.to_ne_bytes());
+            buf.extend_from_slice(value);
+            while !buf.len().is_multiple_of(4) {
+                buf.push(0);
+            }
+        }
+    }
+
+    /// An `RTM_NEWADDR` message: a zeroed nlmsghdr, an ifaddrmsg (family/flags/index), then `attrs`.
+    fn addr_msg(family: c_int, index: u32, flags: u8, attrs: &[(u16, &[u8])]) -> Vec<u8> {
+        let mut m = vec![0u8; nl_align(size_of::<NlMsgHdr>())];
+        m.push(u8::try_from(family).unwrap()); // family
+        m.extend_from_slice(&[0, flags, 0]); // prefixlen, flags, scope
+        m.extend_from_slice(&index.to_ne_bytes()); // index
+        push_attrs(&mut m, attrs);
+        m
+    }
+
+    /// An `RTM_NEWLINK` message: a zeroed nlmsghdr, an ifinfomsg (index), then `attrs`.
+    fn link_msg(index: i32, attrs: &[(u16, &[u8])]) -> Vec<u8> {
+        let mut m = vec![0u8; nl_align(size_of::<NlMsgHdr>())];
+        m.extend_from_slice(&[0, 0]); // family, pad
+        m.extend_from_slice(&0u16.to_ne_bytes()); // dev_type
+        m.extend_from_slice(&index.to_ne_bytes()); // index (i32)
+        m.extend_from_slice(&[0u8; 8]); // flags, change
+        push_attrs(&mut m, attrs);
+        m
+    }
+
+    #[test]
+    fn nl_align_rounds_up_to_four() {
+        assert_eq!(nl_align(0), 0);
+        assert_eq!(nl_align(1), 4);
+        assert_eq!(nl_align(4), 4);
+        assert_eq!(nl_align(5), 8);
+    }
+
+    #[test]
+    fn read_at_bounds_checks_the_read() {
+        let buf = [1u8, 2, 3, 4, 5];
+        assert_eq!(
+            read_at::<u32>(&buf, 1),
+            Some(u32::from_ne_bytes([2, 3, 4, 5]))
+        );
+        assert_eq!(read_at::<u32>(&buf, 2), None); // 2 + 4 > 5
+        assert_eq!(read_at::<u16>(&buf, usize::MAX), None); // offset overflow
+    }
+
+    #[test]
+    fn rtattrs_walks_tlvs_and_stops_at_a_bad_length() {
+        let mut buf = Vec::new();
+        push_attrs(&mut buf, &[(1, &[0xaa, 0xbb]), (2, &[0xcc])]);
+        let got: Vec<(u16, Vec<u8>)> = rtattrs(&buf, 0).map(|(t, v)| (t, v.to_vec())).collect();
+        assert_eq!(got, vec![(1, vec![0xaa, 0xbb]), (2, vec![0xcc])]);
+
+        // A final header whose length runs past the buffer ends the walk after the good attrs.
+        let mut bad = buf.clone();
+        bad.extend_from_slice(&[0xff, 0xff, 0x00, 0x00]); // len = 0xffff
+        assert_eq!(rtattrs(&bad, 0).count(), 2);
+    }
+
+    #[test]
+    fn scan_addr_records_a_usable_v4() {
+        let msg = addr_msg(libc::AF_INET, 5, 0, &[(libc::IFA_ADDRESS, &[10, 0, 0, 1])]);
+        let mut addrs = InterfaceAddresses::default();
+        scan_addr(&msg, "eth0", 5, &mut addrs, &mut V6Pick::default());
+        assert_eq!(addrs.v4, Some(Ipv4Addr::new(10, 0, 0, 1)));
+    }
+
+    #[test]
+    fn scan_addr_prefers_ifa_local_over_ifa_address() {
+        // On point-to-point links IFA_ADDRESS is the peer; IFA_LOCAL is ours.
+        let msg = addr_msg(
+            libc::AF_INET,
+            5,
+            0,
+            &[
+                (libc::IFA_ADDRESS, &[10, 0, 0, 2]),
+                (libc::IFA_LOCAL, &[10, 0, 0, 1]),
+            ],
+        );
+        let mut addrs = InterfaceAddresses::default();
+        scan_addr(&msg, "eth0", 5, &mut addrs, &mut V6Pick::default());
+        assert_eq!(addrs.v4, Some(Ipv4Addr::new(10, 0, 0, 1)));
+    }
+
+    #[test]
+    fn scan_addr_skips_an_unusable_v4() {
+        // IFA_FLAGS carrying TENTATIVE (0x40) supersedes the 8-bit flags and disqualifies it.
+        let msg = addr_msg(
+            libc::AF_INET,
+            5,
+            0,
+            &[
+                (libc::IFA_ADDRESS, &[10, 0, 0, 1]),
+                (libc::IFA_FLAGS, &0x40u32.to_ne_bytes()),
+            ],
+        );
+        let mut addrs = InterfaceAddresses::default();
+        scan_addr(&msg, "eth0", 5, &mut addrs, &mut V6Pick::default());
+        assert_eq!(addrs.v4, None);
+    }
+
+    #[test]
+    fn scan_addr_ignores_a_different_ifindex() {
+        let msg = addr_msg(libc::AF_INET, 99, 0, &[(libc::IFA_ADDRESS, &[10, 0, 0, 1])]);
+        let mut addrs = InterfaceAddresses::default();
+        scan_addr(&msg, "eth0", 5, &mut addrs, &mut V6Pick::default());
+        assert_eq!(addrs.v4, None);
+    }
+
+    #[test]
+    fn scan_addr_records_a_usable_v6() {
+        let v6 = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
+        let msg = addr_msg(libc::AF_INET6, 5, 0, &[(libc::IFA_ADDRESS, &v6.octets())]);
+        let mut addrs = InterfaceAddresses::default();
+        scan_addr(&msg, "eth0", 5, &mut addrs, &mut V6Pick::default());
+        assert_eq!(addrs.v6, Some(v6));
+    }
+
+    #[test]
+    fn scan_link_records_the_mac_only_for_the_right_index() {
+        let mac = [0x02, 0, 0, 0, 0, 0x2a];
+        let msg = link_msg(5, &[(libc::IFLA_ADDRESS, &mac)]);
+        let mut addrs = InterfaceAddresses::default();
+        scan_link(&msg, "eth0", 5, &mut addrs);
+        assert_eq!(addrs.mac, Some(MacAddr::from(mac)));
+
+        let mut other = InterfaceAddresses::default();
+        scan_link(&msg, "eth0", 6, &mut other);
+        assert_eq!(other.mac, None);
+    }
+}
