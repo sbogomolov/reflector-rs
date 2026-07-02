@@ -29,7 +29,7 @@ use std::str::FromStr;
 use serde::Deserialize;
 
 use self::raw::{RawConfig, RawReflector};
-use crate::net::mac::MacAddr;
+use crate::net::mac::MacSet;
 
 /// Wake-on-LAN settings (present only when `WoL` is enabled for the reflector).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,8 +55,8 @@ pub(crate) struct Reflector {
     pub(crate) source_if: InterfaceName,
     /// Interface to emit on (always different from `source_if`).
     pub(crate) target_if: InterfaceName,
-    /// Optional MAC filter; `None` matches any device.
-    pub(crate) mac: Option<MacAddr>,
+    /// Optional device allow-filter; `None` matches any device, `Some` a non-empty set.
+    pub(crate) macs: Option<MacSet>,
     /// IP-version policy for this reflector.
     pub(crate) address_family: AddressFamily,
     /// Wake-on-LAN settings, or `None` when `WoL` is disabled.
@@ -74,7 +74,7 @@ impl Reflector {
         if self.source_if != other.source_if || self.target_if != other.target_if {
             return None;
         }
-        if !macs_overlap(self.mac, other.mac)
+        if !macs_overlap(self.macs.as_ref(), other.macs.as_ref())
             || !families_overlap(self.address_family, other.address_family)
         {
             return None;
@@ -144,7 +144,7 @@ impl TryFrom<(String, RawReflector)> for Reflector {
             name,
             source_if,
             target_if,
-            mac: raw.mac,
+            macs: raw.macs,
             address_family: raw.address_family,
             wol,
             mdns: raw.mdns,
@@ -283,11 +283,11 @@ fn protocol_list(reflector: &Reflector) -> String {
     protocols.join(", ")
 }
 
-/// Two MAC selections overlap when both name the same address or either is
+/// Two MAC selections overlap when they share at least one address, or either is
 /// absent (an absent filter matches any device).
-fn macs_overlap(a: Option<MacAddr>, b: Option<MacAddr>) -> bool {
+fn macs_overlap(a: Option<&MacSet>, b: Option<&MacSet>) -> bool {
     match (a, b) {
-        (Some(a), Some(b)) => a == b,
+        (Some(a), Some(b)) => a.iter().any(|mac| b.contains(mac)),
         _ => true,
     }
 }
@@ -347,7 +347,7 @@ mod tests {
         assert_eq!(r.source_if.as_str(), "lan");
         assert_eq!(r.target_if.as_str(), "iot");
         assert!(r.mdns);
-        assert!(r.mac.is_none());
+        assert!(r.macs.is_none());
         assert_eq!(r.address_family, AddressFamily::Default);
         assert!(r.wol.is_none());
         assert!(r.ssdp.is_none());
@@ -363,7 +363,7 @@ mod tests {
             [reflectors.tv]
             source_if = "en0"
             target_if = "lo0"
-            mac = "B0:37:95:C5:60:BE"
+            macs = ["B0:37:95:C5:60:BE"]
             wol = true
             mdns = true
             ssdp = true
@@ -380,7 +380,9 @@ mod tests {
         assert_eq!(r.name.as_str(), "tv");
         assert_eq!(r.source_if.as_str(), "en0");
         assert_eq!(r.target_if.as_str(), "lo0");
-        assert_eq!(r.mac.unwrap().to_string(), "b0:37:95:c5:60:be");
+        let macs = r.macs.as_ref().unwrap();
+        assert_eq!(macs.len(), 1);
+        assert_eq!(macs[0].to_string(), "b0:37:95:c5:60:be");
         let wol = r.wol.as_ref().unwrap();
         assert!(r.mdns);
         let ssdp = r.ssdp.unwrap();
@@ -609,7 +611,7 @@ mod tests {
             source_if = "a"
             target_if = "b"
             mdns = true
-            mac = "zz:zz:zz:zz:zz:zz"
+            macs = ["zz:zz:zz:zz:zz:zz"]
         "#;
         assert!(matches!(err(text), ConfigError::Parse(_)));
     }
@@ -747,26 +749,26 @@ mod tests {
             source_if = "lan"
             target_if = "iot"
             mdns = true
-            mac = "00:00:00:00:00:01"
+            macs = ["00:00:00:00:00:01"]
 
             [reflectors.b]
             source_if = "lan"
             target_if = "iot"
             mdns = true
-            mac = "00:00:00:00:00:02"
+            macs = ["00:00:00:00:00:02"]
         "#;
         assert!(from_toml(text).is_ok());
     }
 
     #[test]
-    fn omitted_mac_conflicts_with_any() {
+    fn omitted_macs_conflicts_with_any() {
         // An absent MAC filter matches any device, so it overlaps a specific one.
         let text = r#"
             [reflectors.a]
             source_if = "lan"
             target_if = "iot"
             mdns = true
-            mac = "00:00:00:00:00:01"
+            macs = ["00:00:00:00:00:01"]
 
             [reflectors.b]
             source_if = "lan"
@@ -780,6 +782,92 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn macs_list_parses() {
+        let cfg = from_toml(
+            r#"
+            [reflectors.tv]
+            source_if = "lan"
+            target_if = "iot"
+            mdns = true
+            macs = ["00:00:00:00:00:01", "00:00:00:00:00:02"]
+            "#,
+        )
+        .unwrap();
+        let macs = cfg.reflectors[0].macs.as_ref().unwrap();
+        assert_eq!(macs.len(), 2);
+        assert!(macs.contains(&"00:00:00:00:00:01".parse().unwrap()));
+        assert!(macs.contains(&"00:00:00:00:00:02".parse().unwrap()));
+    }
+
+    #[test]
+    fn legacy_mac_field_is_now_unknown() {
+        // `mac` was replaced by `macs` in 0.9.0; deny_unknown_fields rejects the old key.
+        let text = r#"
+            [reflectors.tv]
+            source_if = "lan"
+            target_if = "iot"
+            mdns = true
+            mac = "02:42:ac:11:00:09"
+        "#;
+        assert!(matches!(err(text), ConfigError::Parse(_)));
+    }
+
+    #[test]
+    fn empty_macs_list_rejected() {
+        let text = r#"
+            [reflectors.tv]
+            source_if = "lan"
+            target_if = "iot"
+            mdns = true
+            macs = []
+        "#;
+        assert!(matches!(err(text), ConfigError::Parse(_)));
+    }
+
+    #[test]
+    fn overlapping_macs_sets_conflict() {
+        // The two allow-sets share 00:..:02, so both would reflect that device's mDNS.
+        let text = r#"
+            [reflectors.a]
+            source_if = "lan"
+            target_if = "iot"
+            mdns = true
+            macs = ["00:00:00:00:00:01", "00:00:00:00:00:02"]
+
+            [reflectors.b]
+            source_if = "lan"
+            target_if = "iot"
+            mdns = true
+            macs = ["00:00:00:00:00:02", "00:00:00:00:00:03"]
+        "#;
+        assert!(matches!(
+            err(text),
+            ConfigError::ConflictingReflectors {
+                protocol: Protocol::Mdns,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn disjoint_macs_sets_do_not_conflict() {
+        let text = r#"
+            [reflectors.a]
+            source_if = "lan"
+            target_if = "iot"
+            mdns = true
+            macs = ["00:00:00:00:00:01", "00:00:00:00:00:02"]
+
+            [reflectors.b]
+            source_if = "lan"
+            target_if = "iot"
+            mdns = true
+            macs = ["00:00:00:00:00:03", "00:00:00:00:00:04"]
+        "#;
+        assert!(from_toml(text).is_ok());
     }
 
     #[test]

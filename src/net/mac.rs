@@ -3,6 +3,7 @@
 
 use std::fmt;
 use std::net::IpAddr;
+use std::ops::Deref;
 use std::str::FromStr;
 
 use serde::{Deserialize, Deserializer};
@@ -101,6 +102,82 @@ impl<'de> Deserialize<'de> for MacAddr {
     }
 }
 
+/// A non-empty, duplicate-free set of MAC addresses: a device allow-filter.
+///
+/// The set is always non-empty (mirroring [`WolPorts`](crate::config::WolPorts));
+/// "match any device" is expressed by an absent (`None`) filter at the use site,
+/// not by an empty set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MacSet(Vec<MacAddr>);
+
+impl Deref for MacSet {
+    type Target = [MacAddr];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+/// Error returned when a value is not a valid [`MacSet`].
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub(crate) enum MacSetError {
+    #[error("macs must not be empty")]
+    Empty,
+    #[error("macs contains duplicate address {0}")]
+    Duplicate(MacAddr),
+    /// A comma-separated token was not a valid MAC address.
+    #[error("macs has an invalid address \"{0}\"")]
+    BadMac(String),
+}
+
+/// A single address is a valid one-element set.
+impl From<MacAddr> for MacSet {
+    fn from(mac: MacAddr) -> Self {
+        MacSet(vec![mac])
+    }
+}
+
+impl TryFrom<Vec<MacAddr>> for MacSet {
+    type Error = MacSetError;
+
+    fn try_from(macs: Vec<MacAddr>) -> Result<Self, Self::Error> {
+        if macs.is_empty() {
+            return Err(MacSetError::Empty);
+        }
+        for (i, mac) in macs.iter().enumerate() {
+            if macs[..i].contains(mac) {
+                return Err(MacSetError::Duplicate(*mac));
+            }
+        }
+        Ok(Self(macs))
+    }
+}
+
+impl FromStr for MacSet {
+    type Err = MacSetError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let macs = s
+            .split(',')
+            .map(|token| {
+                let token = token.trim();
+                token
+                    .parse::<MacAddr>()
+                    .map_err(|_| MacSetError::BadMac(token.to_owned()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        MacSet::try_from(macs)
+    }
+}
+
+impl<'de> Deserialize<'de> for MacSet {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Vec::<MacAddr>::deserialize(deserializer)?
+            .try_into()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,5 +267,40 @@ mod tests {
     fn mac_display_zero_pads_octets() {
         let mac = MacAddr::from([0x01, 0x02, 0x03, 0x04, 0x05, 0x0a]);
         assert_eq!(mac.to_string(), "01:02:03:04:05:0a");
+    }
+
+    #[test]
+    fn mac_set_parses_a_csv_via_fromstr() {
+        let set = "aa:bb:cc:dd:ee:01, aa:bb:cc:dd:ee:02"
+            .parse::<MacSet>()
+            .unwrap();
+        assert_eq!(set.len(), 2);
+        assert!(set.contains(&MacAddr::from([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x01])));
+        assert!(set.contains(&MacAddr::from([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x02])));
+        assert!(!set.contains(&MacAddr::from([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x03])));
+    }
+
+    #[test]
+    fn mac_set_from_a_single_address() {
+        let mac = MacAddr::from([0x01, 0x02, 0x03, 0x04, 0x05, 0x06]);
+        let set = MacSet::from(mac);
+        assert_eq!(&*set, &[mac]);
+    }
+
+    #[test]
+    fn mac_set_rejects_duplicates_and_bad_and_empty() {
+        assert!(matches!(
+            "aa:bb:cc:dd:ee:01,aa:bb:cc:dd:ee:01".parse::<MacSet>(),
+            Err(MacSetError::Duplicate(_))
+        ));
+        assert!(matches!(
+            "aa:bb:cc:dd:ee:01,zz".parse::<MacSet>(),
+            Err(MacSetError::BadMac(bad)) if bad == "zz"
+        ));
+        // FromStr can't yield an empty list, so Empty is reachable only via TryFrom.
+        assert!(matches!(
+            MacSet::try_from(Vec::<MacAddr>::new()),
+            Err(MacSetError::Empty)
+        ));
     }
 }

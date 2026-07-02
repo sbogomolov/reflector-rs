@@ -12,7 +12,7 @@ use super::value::{
     InterfaceName, ParseAddressFamilyError, ParseInterfaceNameError, ParseLogLevelError,
     ParseReflectorNameError, ReflectorName, WolPortsError,
 };
-use crate::net::mac::ParseMacAddrError;
+use crate::net::mac::MacSetError;
 
 /// Everything that can make a configuration invalid.
 ///
@@ -146,9 +146,9 @@ pub(crate) enum ParseValueError {
     /// `ADDRESS_FAMILY`.
     #[error(transparent)]
     AddressFamily(#[from] ParseAddressFamilyError),
-    /// `MAC`.
+    /// `MACS`.
     #[error(transparent)]
-    Mac(#[from] ParseMacAddrError),
+    Macs(#[from] MacSetError),
     /// `SOURCE_IF`/`TARGET_IF`.
     #[error(transparent)]
     Interface(#[from] ParseInterfaceNameError),

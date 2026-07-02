@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use crate::dispatch::{CaptureKey, Filter, PacketDispatcher, PacketHandler, RegistrationKey};
 use crate::interface::{InterfaceAddresses, Ipv6Scope};
-use crate::net::mac::MacAddr;
+use crate::net::mac::{MacAddr, MacSet};
 use crate::net::packet::Packet;
 use crate::net::port_reservation::PortReservation;
 use crate::net::ssdp::{MSEARCH_MX_DEFAULT, SSDP_TTL, SsdpKind, classify, parse_msearch_mx};
@@ -110,8 +110,8 @@ pub(super) struct SsdpSearchReflector {
     target: CaptureKey,
     /// The target interface's index, for the IPv6 link-local reserved-port bind.
     target_ifindex: u32,
-    /// The configured device MAC, scoping the response capture as the advertisement direction is.
-    device_mac: Option<MacAddr>,
+    /// The configured device allow-set, scoping the response capture as the advertisement direction is.
+    device_macs: Option<MacSet>,
     /// DIAL `LOCATION` rewriting, stamped into each session's [`SsdpResponseReflector`].
     dial: Option<DialRewrite>,
     sessions: Vec<Session>,
@@ -122,14 +122,14 @@ impl SsdpSearchReflector {
         source: CaptureKey,
         target: CaptureKey,
         target_ifindex: u32,
-        device_mac: Option<MacAddr>,
+        device_macs: Option<MacSet>,
         dial: Option<DialRewrite>,
     ) -> Self {
         Self {
             source,
             target,
             target_ifindex,
-            device_mac,
+            device_macs,
             dial,
             sessions: Vec::new(),
         }
@@ -196,7 +196,7 @@ impl SsdpSearchReflector {
             Filter {
                 dst_ip: Some(our_addr),
                 dst_port: Some(reservation.port()),
-                src_mac: self.device_mac,
+                src_mac: self.device_macs.clone(),
                 ..Filter::default()
             },
             Box::new(SsdpResponseReflector {
