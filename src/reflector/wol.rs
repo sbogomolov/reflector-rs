@@ -10,7 +10,7 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use crate::config::{AddressFamily, Reflector};
 use crate::dispatch::{CaptureKey, Filter, PacketDispatcher, PacketHandler};
-use crate::net::mac::MacAddr;
+use crate::net::mac::MacSet;
 use crate::net::packet::Packet;
 use crate::reactor::Reactor;
 
@@ -32,8 +32,8 @@ const V6_ALL_NODES: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1);
 /// One is registered per configured port.
 struct WolReflector {
     egress: CaptureKey,
-    /// Optional device filter; `None` reflects a wake for any device.
-    target_mac: Option<MacAddr>,
+    /// Optional device allow-set; `None` reflects a wake for any device.
+    target_macs: Option<MacSet>,
     /// IP-version policy: which families this reflector re-emits.
     family: AddressFamily,
 }
@@ -45,7 +45,7 @@ impl PacketHandler for WolReflector {
         dispatcher: &mut PacketDispatcher,
         _reactor: &mut Reactor,
     ) {
-        if !is_magic_packet(packet.payload, self.target_mac) {
+        if !is_magic_packet(packet.payload, self.target_macs.as_ref()) {
             log::debug!("WoL: ignoring non-magic packet from {}", packet.source);
             return;
         }
@@ -84,9 +84,9 @@ impl PacketHandler for WolReflector {
 /// Whether `payload` opens with a Wake-on-LAN magic packet for an acceptable target: the
 /// `6×0xFF` prefix followed by one MAC repeated 16 times. Trailing bytes (a `SecureOn` password)
 /// are ignored — only the leading [`MAGIC_LEN`] are inspected — and the caller forwards them
-/// as-is. When `target_mac` is set, the repeated MAC must equal it, so only that one device's
+/// as-is. When `targets` is set, the repeated MAC must be a member, so only those devices'
 /// wakes are reflected.
-fn is_magic_packet(payload: &[u8], target_mac: Option<MacAddr>) -> bool {
+fn is_magic_packet(payload: &[u8], targets: Option<&MacSet>) -> bool {
     let Some(magic) = payload.get(..MAGIC_LEN) else {
         return false;
     };
@@ -101,8 +101,8 @@ fn is_magic_packet(payload: &[u8], target_mac: Option<MacAddr>) -> bool {
     {
         return false;
     }
-    // A configured target narrows the reflector to that device's wake.
-    target_mac.is_none_or(|target| mac == target.octets())
+    // A configured allow-set narrows the reflector to those devices' wakes.
+    targets.is_none_or(|targets| targets.iter().any(|target| mac == target.octets()))
 }
 
 /// The link-wide destination a magic packet captured as `packet` re-emits to under `family`: the
@@ -155,7 +155,7 @@ pub(crate) fn build(
             },
             Box::new(WolReflector {
                 egress,
-                target_mac: reflector.mac,
+                target_macs: reflector.macs.clone(),
                 family: reflector.address_family,
             }),
         );
@@ -173,6 +173,7 @@ pub(crate) fn build(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::net::mac::MacAddr;
 
     const DEVICE: [u8; 6] = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06];
 
@@ -201,8 +202,20 @@ mod tests {
     #[test]
     fn filters_to_the_configured_device() {
         let packet = magic_packet(DEVICE, &[]);
-        assert!(is_magic_packet(&packet, Some(MacAddr::from(DEVICE))));
-        assert!(!is_magic_packet(&packet, Some(MacAddr::from([0xaa; 6]))));
+        let allowed = MacSet::from(MacAddr::from(DEVICE));
+        assert!(is_magic_packet(&packet, Some(&allowed)));
+        let others = MacSet::from(MacAddr::from([0xaa; 6]));
+        assert!(!is_magic_packet(&packet, Some(&others)));
+    }
+
+    #[test]
+    fn filters_to_any_of_several_configured_devices() {
+        let packet = magic_packet(DEVICE, &[]);
+        let set = MacSet::try_from(vec![MacAddr::from([0xaa; 6]), MacAddr::from(DEVICE)]).unwrap();
+        assert!(is_magic_packet(&packet, Some(&set)));
+        let disjoint =
+            MacSet::try_from(vec![MacAddr::from([0xaa; 6]), MacAddr::from([0xbb; 6])]).unwrap();
+        assert!(!is_magic_packet(&packet, Some(&disjoint)));
     }
 
     #[test]

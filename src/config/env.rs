@@ -10,7 +10,7 @@ use std::str::FromStr;
 use super::error::{ConfigError, ParseBoolError, ParseValueError, RequiredField};
 use super::raw::{RawConfig, RawReflector};
 use super::value::{AddressFamily, InterfaceName, LogLevel, ReflectorName, WolPorts};
-use crate::net::mac::MacAddr;
+use crate::net::mac::MacSet;
 
 /// Accumulates a reflector's fields across its `REFLECTOR_<tag>_<param>` variables,
 /// then converts to a [`RawReflector`] once all are seen.
@@ -19,7 +19,7 @@ struct PartialReflector {
     name: Option<ReflectorName>,
     source_if: Option<InterfaceName>,
     target_if: Option<InterfaceName>,
-    mac: Option<MacAddr>,
+    macs: Option<MacSet>,
     wol: Option<bool>,
     mdns: Option<bool>,
     ssdp: Option<bool>,
@@ -35,7 +35,7 @@ impl PartialReflector {
             "name" => self.name = Some(env_value(value, var)?),
             "source_if" => self.source_if = Some(env_value(value, var)?),
             "target_if" => self.target_if = Some(env_value(value, var)?),
-            "mac" => self.mac = Some(env_value(value, var)?),
+            "macs" => self.macs = Some(env_value(value, var)?),
             "wol_ports" => self.wol_ports = Some(env_value(value, var)?),
             "address_family" => self.address_family = Some(env_value(value, var)?),
             "wol" => self.wol = Some(env_bool(value, var)?),
@@ -64,7 +64,7 @@ impl PartialReflector {
                 name: name.to_owned(),
                 field: RequiredField::TargetIf,
             })?,
-            mac: self.mac,
+            macs: self.macs,
             wol: self.wol.unwrap_or(false),
             mdns: self.mdns.unwrap_or(false),
             ssdp: self.ssdp.unwrap_or(false),
@@ -261,6 +261,36 @@ mod tests {
     }
 
     #[test]
+    fn env_macs_csv() {
+        let cfg = from_env(&[
+            ("REFLECTOR_TV_SOURCE_IF", "a"),
+            ("REFLECTOR_TV_TARGET_IF", "b"),
+            ("REFLECTOR_TV_MDNS", "true"),
+            ("REFLECTOR_TV_MACS", "00:00:00:00:00:01, 00:00:00:00:00:02"),
+        ])
+        .unwrap();
+        let macs = cfg.reflectors[0].macs.as_ref().unwrap();
+        // The two addresses parse, in order, with the surrounding CSV whitespace trimmed.
+        let addrs: Vec<String> = macs.iter().map(ToString::to_string).collect();
+        assert_eq!(addrs, ["00:00:00:00:00:01", "00:00:00:00:00:02"]);
+    }
+
+    #[test]
+    fn env_legacy_mac_param_is_now_unknown() {
+        // `mac` was replaced by `macs` in 0.9.0; the old singular param is no longer recognized.
+        assert!(matches!(
+            from_env(&[
+                ("REFLECTOR_TV_SOURCE_IF", "a"),
+                ("REFLECTOR_TV_TARGET_IF", "b"),
+                ("REFLECTOR_TV_MDNS", "true"),
+                ("REFLECTOR_TV_MAC", "02:42:ac:11:00:09"),
+            ])
+            .unwrap_err(),
+            ConfigError::EnvUnknownParam { param, .. } if param == "mac"
+        ));
+    }
+
+    #[test]
     fn env_reuses_cross_field_validation() {
         let e = from_env(&[
             ("REFLECTOR_TV_SOURCE_IF", "a"),
@@ -408,9 +438,9 @@ mod tests {
             }
         ));
         assert!(matches!(
-            from_env(&[("REFLECTOR_TV_MAC", "zz")]).unwrap_err(),
+            from_env(&[("REFLECTOR_TV_MACS", "zz")]).unwrap_err(),
             ConfigError::EnvBadValue {
-                source: ParseValueError::Mac(_),
+                source: ParseValueError::Macs(_),
                 ..
             }
         ));

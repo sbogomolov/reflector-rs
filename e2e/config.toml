@@ -7,7 +7,7 @@ log_level = "debug"
 [reflectors.wol-mac]
 source_if = "wol_src"
 target_if = "wol_dst"
-mac = "02:42:ac:11:00:09"
+macs = ["02:42:ac:11:00:09", "02:42:ac:11:00:0c"]
 wol = true
 wol_ports = [40009]
 

@@ -19,14 +19,14 @@ It reflects three link-local protocols, and layers an optional DIAL proxy on top
   [DIAL](#dial).
 
 Each named entry bridges one `source_if` → `target_if` interface pair and enables any combination of
-these. The same shape serves a single device (pin its `mac`) or a whole network (omit it).
+these. The same shape serves one or a few specific devices (`macs`) or a whole network (omit it).
 
 ## Contents
 
 - [Platform support](#platform-support)
 - [Build](#build)
 - [Run](#run) — [privileges](#runtime-privileges), [Docker](#run-in-docker), [MikroTik](#on-mikrotik-routeros)
-- [Configuration](#configuration) — [env vars](#environment-variables), [`mac`](#the-mac-field), [`address_family`](#address_family), [per-protocol behavior](#per-protocol-behavior), [DIAL](#dial), [duplicate detection](#duplicate-detection)
+- [Configuration](#configuration) — [env vars](#environment-variables), [`macs`](#the-macs-field), [`address_family`](#address_family), [per-protocol behavior](#per-protocol-behavior), [DIAL](#dial), [duplicate detection](#duplicate-detection)
 - [Tests](#tests)
 - [Release](#release)
 - [License](#license)
@@ -198,7 +198,7 @@ them as the entry's `source_if` / `target_if`:
 [reflectors.livingroom-tv]
 source_if = "veth-lan"   # veth bridged into the LAN VLAN
 target_if = "veth-iot"   # veth bridged into the IoT VLAN
-mac       = "B0:37:95:C5:60:BE"   # optional; target a specific device (omit for the whole VLAN)
+macs      = ["B0:37:95:C5:60:BE"] # optional; scope to specific device(s) (omit for the whole VLAN)
 wol       = true         # enable Wake-on-LAN, disabled by default
 mdns      = true         # enable mDNS, disabled by default
 ssdp      = true         # enable SSDP, disabled by default
@@ -207,7 +207,7 @@ dial      = true         # enable the DIAL proxy, disabled by default
 
 On RouterOS, setting the container's environment variables is usually easier than mounting a file: the
 entry above becomes `REFLECTOR_TV_SOURCE_IF=veth-lan`, `REFLECTOR_TV_TARGET_IF=veth-iot`,
-`REFLECTOR_TV_MAC=B0:37:95:C5:60:BE`, `REFLECTOR_TV_WOL=true`, and so on (see
+`REFLECTOR_TV_MACS=B0:37:95:C5:60:BE`, `REFLECTOR_TV_WOL=true`, and so on (see
 [Environment variables](#environment-variables)). To use the file instead, mount it to
 `/etc/reflector/config.toml` and set that path as the container's command argument. For the RouterOS
 side — enabling container mode, creating the `veth`s, and attaching each to its VLAN — see MikroTik's
@@ -227,7 +227,7 @@ debug_memory = false             # optional; periodically log RSS + heap stats f
 [reflectors.tv]
 source_if = "en0"                # required; interface to listen on (must differ from target_if)
 target_if = "lo0"                # required; interface to emit reflected traffic on
-mac       = "B0:37:95:C5:60:BE"  # optional; the device's MAC (see below). Omit for a whole network.
+macs      = ["B0:37:95:C5:60:BE"] # optional; device(s) to scope to (see below). Omit for a whole network.
 wol       = true                 # optional; enable Wake-on-LAN reflection (default false)
 mdns      = true                 # optional; enable mDNS reflection (default false)
 ssdp      = true                 # optional; enable SSDP reflection (default false)
@@ -237,8 +237,9 @@ address_family = "default"       # optional; default | dual | ipv4 | ipv6 (defau
 ```
 
 An entry must enable at least one protocol and expands into one reflector per enabled protocol, all
-sharing the entry's interfaces, `mac`, and `address_family`. The same shape serves a single device (set
-`mac`) or a whole network (omit `mac`). No IP addresses ever appear in the config. `dial` is not a
+sharing the entry's interfaces, MAC selection, and `address_family`. The same shape serves one or a few
+specific devices (set `macs`) or a whole network (omit it). No IP addresses ever
+appear in the config. `dial` is not a
 separate reflector — it augments the entry's SSDP reflector with the DIAL application proxy (so it
 requires `ssdp`; see [DIAL](#dial)).
 
@@ -250,18 +251,19 @@ then optional; with none, the environment is the whole configuration. Variables 
 
 - `<TAG>` ties one entry's parameters together — any alphanumeric string (`1`, `2`, `TV`, …). It also
   becomes the entry's name (and thus its log label) unless a `NAME` parameter overrides it.
-- `<PARAM>` is `NAME` or any field from the entry table above (`SOURCE_IF`, `TARGET_IF`, `MAC`, `WOL`,
-  `MDNS`, `SSDP`, `DIAL`, `WOL_PORTS`, `ADDRESS_FAMILY`), case-insensitive.
+- `<PARAM>` is `NAME` or any field from the entry table above (`SOURCE_IF`, `TARGET_IF`, `MACS`,
+  `WOL`, `MDNS`, `SSDP`, `DIAL`, `WOL_PORTS`, `ADDRESS_FAMILY`), case-insensitive.
 
 The globals are `REFLECTOR_LOG_LEVEL` and `REFLECTOR_DEBUG_MEMORY`, so `LOG` and `DEBUG` are reserved
-tags. Booleans are `true`/`false` or `1`/`0`; `WOL_PORTS` is comma-separated (`7,9`). The
+tags. Booleans are `true`/`false` or `1`/`0`; `WOL_PORTS` and `MACS` are comma-separated (`7,9` /
+`B0:...,C4:...`). The
 `[reflectors.tv]` entry above looks like this in the environment:
 
 ```sh
 REFLECTOR_LOG_LEVEL=info
 REFLECTOR_TV_SOURCE_IF=en0
 REFLECTOR_TV_TARGET_IF=lo0
-REFLECTOR_TV_MAC=B0:37:95:C5:60:BE
+REFLECTOR_TV_MACS=B0:37:95:C5:60:BE
 REFLECTOR_TV_WOL=true
 REFLECTOR_TV_MDNS=true
 REFLECTOR_TV_SSDP=true
@@ -274,19 +276,22 @@ combined configuration, and `REFLECTOR_LOG_LEVEL` / `REFLECTOR_DEBUG_MEMORY` ove
 sources. An unknown `<PARAM>`, a non-alphanumeric or reserved tag, and a tag with no parameter are all
 rejected at startup.
 
-### The `mac` field
+### The `macs` field
 
-`mac` is optional and, when set, names a single device — coherently across WoL, mDNS, and SSDP, because
-a device's NIC MAC is both the target of its Wake-on-LAN magic packet and the L2 source of its mDNS/SSDP
-advertisements:
+`macs` is an optional list naming the device(s) an entry is scoped to — coherently across WoL, mDNS,
+and SSDP, because a device's NIC MAC is both the target of its Wake-on-LAN magic packet and the L2
+source of its mDNS/SSDP advertisements. A single device is just a one-entry list
+(`macs = ["B0:37:95:C5:60:BE"]`); list several to scope one entry to a set of devices
+(`macs = ["B0:37:95:C5:60:BE", "C4:9D:8F:11:22:33"]`). Below, "the allow-set" means the configured
+devices:
 
-- **WoL** re-emits only magic packets whose payload targets `mac`.
-- **mDNS / SSDP** relay, in the target→source direction, only frames whose L2 source MAC is `mac`
-  (exposing just that device); the source→target direction is never MAC-filtered. For SSDP the same
-  filter scopes the proxied unicast `200 OK` replies — only `mac`'s responses are carried back to a
-  searcher.
+- **WoL** re-emits only magic packets whose payload targets a device in the allow-set.
+- **mDNS / SSDP** relay, in the target→source direction, only frames whose L2 source MAC is in the
+  allow-set (exposing just those devices); the source→target direction is never MAC-filtered. For SSDP
+  the same filter scopes the proxied unicast `200 OK` replies — only the allow-set's responses are
+  carried back to a searcher.
 
-Omit `mac` for a network-level entry: WoL proxies every valid magic packet, and mDNS/SSDP reflect all
+Omit `macs` for a network-level entry: WoL proxies every valid magic packet, and mDNS/SSDP reflect all
 traffic in both directions.
 
 ### `address_family`
@@ -367,8 +372,8 @@ Entry names must be unique across the file and the environment — a name that a
 same name from both sources) is rejected at startup. Beyond that, two entries that enable the same
 protocol are rejected as a duplicate of that protocol only when they could reflect the same packet
 twice: same `source_if`, same `target_if`, overlapping MAC selection, overlapping address-family
-handling, and — for WoL — at least one shared port. MAC selection overlaps when both entries set the
-same `mac`, or when either omits `mac` (any device). Address-family handling overlaps when both can
+handling, and — for WoL — at least one shared port. MAC selection overlaps when the entries' allow-sets
+share at least one device, or when either omits its MAC filter (any device). Address-family handling overlaps when both can
 handle the same IP version: an `ipv4`-only and an `ipv6`-only entry never overlap, while `default`/`dual`
 overlap with either. Entries that differ in interface, MAC, address family (or WoL ports), or that
 enable *different* protocols, coexist.

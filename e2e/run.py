@@ -36,6 +36,8 @@ DEFAULT_REFLECTOR_IMAGE = "reflector:e2e"
 VALGRIND_REFLECTOR_IMAGE = "reflector:e2e-valgrind"
 DEFAULT_HELPER_IMAGE = "python:3.13-alpine"
 CONFIGURED_MAC = "02:42:ac:11:00:09"
+# A second address in wol-mac's `macs` allow-set, to prove the list admits every member, not just the first.
+SECOND_CONFIGURED_MAC = "02:42:ac:11:00:0c"
 WRONG_MAC = "02:42:ac:11:00:0a"
 CONFIGURED_PORT = 40009
 UNCONFIGURED_PORT = 40010
@@ -182,6 +184,14 @@ TEST_CASES = [
         timeout_seconds=5.0,
         send_mac=CONFIGURED_MAC,
         family=6,
+    ),
+    TestCase(
+        name="reflects_second_configured_mac",
+        send_port=CONFIGURED_PORT,
+        receive_port=CONFIGURED_PORT,
+        expect_mac=SECOND_CONFIGURED_MAC,
+        timeout_seconds=5.0,
+        send_mac=SECOND_CONFIGURED_MAC,
     ),
     TestCase(
         name="ignores_wrong_mac",

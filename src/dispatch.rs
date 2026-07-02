@@ -32,7 +32,7 @@ use std::time::Instant;
 use crate::capture::Capture;
 use crate::interface::{AddressMonitor, InterfaceAddresses};
 use crate::net::LinkType;
-use crate::net::mac::MacAddr;
+use crate::net::mac::{MacAddr, MacSet};
 use crate::net::packet::Packet;
 use crate::reactor::{Arena, Handler, Key, Reactor, ReadyEvent};
 
@@ -92,13 +92,14 @@ pub(crate) struct RegistrationKey(Key);
 /// An optional-field packet filter: an unset field
 /// matches anything. A `src_mac`/`dst_mac` filter never matches a `DLT_NULL` packet,
 /// which has no L2 addresses.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 pub(crate) struct Filter {
     pub(crate) src_ip: Option<IpAddr>,
     pub(crate) dst_ip: Option<IpAddr>,
     pub(crate) src_port: Option<u16>,
     pub(crate) dst_port: Option<u16>,
-    pub(crate) src_mac: Option<MacAddr>,
+    /// Allow-set on the source MAC: the packet's source must be a member.
+    pub(crate) src_mac: Option<MacSet>,
     pub(crate) dst_mac: Option<MacAddr>,
 }
 
@@ -109,7 +110,10 @@ impl Filter {
             && self.dst_ip.is_none_or(|ip| p.dest.ip() == ip)
             && self.src_port.is_none_or(|port| p.source.port() == port)
             && self.dst_port.is_none_or(|port| p.dest.port() == port)
-            && self.src_mac.is_none_or(|mac| p.src_mac == Some(mac))
+            && self
+                .src_mac
+                .as_ref()
+                .is_none_or(|set| p.src_mac.is_some_and(|mac| set.contains(&mac)))
             && self.dst_mac.is_none_or(|mac| p.dst_mac == Some(mac))
     }
 }
@@ -676,7 +680,7 @@ mod tests {
     fn filter_matches_source_mac_and_excludes_others() {
         let device = MacAddr::from([0x02, 0, 0, 0, 0, 0x01]);
         let f = Filter {
-            src_mac: Some(device),
+            src_mac: Some(MacSet::from(device)),
             ..Filter::default()
         };
         assert!(f.matches(&packet(
@@ -689,6 +693,21 @@ mod tests {
         let other = MacAddr::from([0x02, 0, 0, 0, 0, 0x02]);
         assert!(!f.matches(&packet("10.0.0.1:5353", "10.0.0.2:5353", None, Some(other))));
         assert!(!f.matches(&packet("10.0.0.1:5353", "10.0.0.2:5353", None, None)));
+    }
+
+    #[test]
+    fn filter_source_mac_set_matches_any_member() {
+        let a = MacAddr::from([0x02, 0, 0, 0, 0, 0x01]);
+        let b = MacAddr::from([0x02, 0, 0, 0, 0, 0x02]);
+        let f = Filter {
+            src_mac: Some(MacSet::try_from(vec![a, b]).unwrap()),
+            ..Filter::default()
+        };
+        assert!(f.matches(&packet("10.0.0.1:5353", "10.0.0.2:5353", None, Some(a))));
+        assert!(f.matches(&packet("10.0.0.1:5353", "10.0.0.2:5353", None, Some(b))));
+        // A device outside the set misses.
+        let other = MacAddr::from([0x02, 0, 0, 0, 0, 0x03]);
+        assert!(!f.matches(&packet("10.0.0.1:5353", "10.0.0.2:5353", None, Some(other))));
     }
 
     #[test]

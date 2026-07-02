@@ -11,7 +11,7 @@ use serde::Deserialize;
 
 use super::error::ConfigError;
 use super::value::{AddressFamily, InterfaceName, LogLevel, ReflectorName, WolPorts};
-use crate::net::mac::MacAddr;
+use crate::net::mac::MacSet;
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -35,7 +35,7 @@ pub(super) struct RawReflector {
     pub(super) name: Option<ReflectorName>,
     pub(super) source_if: InterfaceName,
     pub(super) target_if: InterfaceName,
-    pub(super) mac: Option<MacAddr>,
+    pub(super) macs: Option<MacSet>,
     #[serde(default)]
     pub(super) wol: bool,
     #[serde(default)]

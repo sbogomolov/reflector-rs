@@ -129,7 +129,7 @@ pub(crate) fn build(
             Filter {
                 dst_ip: Some(group_ip),
                 dst_port: Some(SSDP_PORT),
-                src_mac: reflector.mac,
+                src_mac: reflector.macs.clone(),
                 ..Filter::default()
             },
             Box::new(SsdpAdvertisementReflector::new(source, dial)),
@@ -147,7 +147,7 @@ pub(crate) fn build(
                 source,
                 target,
                 target_ifindex,
-                reflector.mac,
+                reflector.macs.clone(),
                 dial,
             )),
         );

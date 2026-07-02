@@ -135,7 +135,7 @@ pub(crate) fn build(
             Filter {
                 dst_ip: Some(group_ip),
                 dst_port: Some(MDNS_PORT),
-                src_mac: reflector.mac,
+                src_mac: reflector.macs.clone(),
                 ..Filter::default()
             },
             Box::new(MdnsReflector {
