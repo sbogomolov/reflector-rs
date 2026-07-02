@@ -9,7 +9,7 @@
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use crate::config::{AddressFamily, Reflector};
-use crate::dispatch::{CaptureKey, Filter, PacketDispatcher, PacketHandler};
+use crate::dispatch::{CaptureKey, Filter, PacketDispatcher, PacketHandler, PortSet};
 use crate::net::mac::MacSet;
 use crate::net::packet::Packet;
 use crate::reactor::Reactor;
@@ -146,20 +146,21 @@ pub(crate) fn build(
         });
     }
 
-    for port in wol.ports.iter() {
-        dispatcher.register(
-            ingress,
-            Filter {
-                dst_port: Some(port.get()),
-                ..Filter::default()
-            },
-            Box::new(WolReflector {
-                egress,
-                target_macs: reflector.macs.clone(),
-                family: reflector.address_family,
-            }),
-        );
-    }
+    // One handler spans every configured port; its filter matches the port set. The re-emit uses the
+    // captured destination port, so a single reflector serves them all.
+    let ports: PortSet = wol.ports.iter().map(|port| port.get()).collect();
+    dispatcher.register(
+        ingress,
+        Filter {
+            dst_port: Some(ports),
+            ..Filter::default()
+        },
+        Box::new(WolReflector {
+            egress,
+            target_macs: reflector.macs.clone(),
+            family: reflector.address_family,
+        }),
+    );
     log::info!(
         "WoL reflector \"{}\": {} -> {} on {} port(s)",
         reflector.name.as_str(),

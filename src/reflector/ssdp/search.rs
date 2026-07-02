@@ -21,7 +21,7 @@ use super::{DialRewrite, dial_rewrite};
 const SESSION_GRACE: Duration = Duration::from_secs(2);
 /// In-flight session cap, so a burst of searchers can't exhaust ephemeral ports or registrations.
 /// At the cap a new M-SEARCH is dropped (no live session is evicted early).
-const MAX_SESSIONS: usize = 32;
+const MAX_SESSIONS: usize = 64;
 
 /// One in-flight M-SEARCH. The searcher (`ip:port`) is the dedup key; `expiry` is when the session
 /// lapses; `reservation` holds the ephemeral target port the 200-OKs arrive on for the session's life
@@ -194,8 +194,8 @@ impl SsdpSearchReflector {
         let response_key = dispatcher.register(
             self.target,
             Filter {
-                dst_ip: Some(our_addr),
-                dst_port: Some(reservation.port()),
+                dst_ip: Some(our_addr.into()),
+                dst_port: Some(reservation.port().into()),
                 src_mac: self.device_macs.clone(),
                 ..Filter::default()
             },

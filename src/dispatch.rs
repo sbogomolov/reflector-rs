@@ -26,6 +26,7 @@ pub(crate) use self::dial_context::DialContext;
 
 use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::ops::Deref;
 use std::os::fd::{AsRawFd, RawFd};
 use std::time::Instant;
 
@@ -89,15 +90,54 @@ impl CaptureKey {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct RegistrationKey(Key);
 
+/// A non-empty set of one filter field's accepted values, so a single registration can span several —
+/// mDNS's two multicast groups (`dst_ip`), or `WoL`'s ports (`dst_port`). A one-element set pins a
+/// single value.
+#[derive(Clone)]
+pub(crate) struct FilterSet<T>(Box<[T]>);
+
+impl<T> Deref for FilterSet<T> {
+    type Target = [T];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+/// A single value is a valid one-element set.
+impl<T> From<T> for FilterSet<T> {
+    fn from(value: T) -> Self {
+        FilterSet(Box::new([value]))
+    }
+}
+
+/// A fixed array of values (a known set of groups or ports) converts directly.
+impl<T, const N: usize> From<[T; N]> for FilterSet<T> {
+    fn from(values: [T; N]) -> Self {
+        FilterSet(Box::from(values))
+    }
+}
+
+impl<T> FromIterator<T> for FilterSet<T> {
+    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+        FilterSet(iter.into_iter().collect())
+    }
+}
+
+/// The `dst_ip` filter set: the multicast groups one handler serves.
+pub(crate) type IpSet = FilterSet<IpAddr>;
+/// The `dst_port` filter set: the ports one handler serves.
+pub(crate) type PortSet = FilterSet<u16>;
+
 /// An optional-field packet filter: an unset field
 /// matches anything. A `src_mac`/`dst_mac` filter never matches a `DLT_NULL` packet,
-/// which has no L2 addresses.
+/// which has no L2 addresses. `dst_ip`/`dst_port` match membership in their [`FilterSet`].
 #[derive(Clone, Default)]
 pub(crate) struct Filter {
     pub(crate) src_ip: Option<IpAddr>,
-    pub(crate) dst_ip: Option<IpAddr>,
+    pub(crate) dst_ip: Option<IpSet>,
     pub(crate) src_port: Option<u16>,
-    pub(crate) dst_port: Option<u16>,
+    pub(crate) dst_port: Option<PortSet>,
     /// Allow-set on the source MAC: the packet's source must be a member.
     pub(crate) src_mac: Option<MacSet>,
     pub(crate) dst_mac: Option<MacAddr>,
@@ -107,9 +147,15 @@ impl Filter {
     /// Whether `p` satisfies every set field (an unset field matches anything).
     fn matches(&self, p: &Packet) -> bool {
         self.src_ip.is_none_or(|ip| p.source.ip() == ip)
-            && self.dst_ip.is_none_or(|ip| p.dest.ip() == ip)
+            && self
+                .dst_ip
+                .as_ref()
+                .is_none_or(|set| set.contains(&p.dest.ip()))
             && self.src_port.is_none_or(|port| p.source.port() == port)
-            && self.dst_port.is_none_or(|port| p.dest.port() == port)
+            && self
+                .dst_port
+                .as_ref()
+                .is_none_or(|set| set.contains(&p.dest.port()))
             && self
                 .src_mac
                 .as_ref()
@@ -666,14 +712,48 @@ mod tests {
     #[test]
     fn filter_matches_destination_group_and_port() {
         let f = Filter {
-            dst_ip: Some("224.0.0.251".parse().unwrap()),
-            dst_port: Some(5353),
+            dst_ip: Some("224.0.0.251".parse::<IpAddr>().unwrap().into()),
+            dst_port: Some(5353.into()),
             ..Filter::default()
         };
         assert!(f.matches(&packet("10.0.0.1:5353", "224.0.0.251:5353", None, None)));
         // Wrong group, and wrong port, each miss.
         assert!(!f.matches(&packet("10.0.0.1:5353", "224.0.0.252:5353", None, None)));
         assert!(!f.matches(&packet("10.0.0.1:5353", "224.0.0.251:1900", None, None)));
+    }
+
+    #[test]
+    fn filter_dst_ip_set_matches_any_group() {
+        // One handler spanning the v4 and v6 mDNS groups: either destination matches.
+        let f = Filter {
+            dst_ip: Some(
+                [
+                    "224.0.0.251".parse::<IpAddr>().unwrap(),
+                    "ff02::fb".parse().unwrap(),
+                ]
+                .into(),
+            ),
+            dst_port: Some(5353.into()),
+            ..Filter::default()
+        };
+        assert!(f.matches(&packet("10.0.0.1:5353", "224.0.0.251:5353", None, None)));
+        assert!(f.matches(&packet("[fe80::1]:5353", "[ff02::fb]:5353", None, None)));
+        // A group outside the set, and a member on the wrong port, each miss.
+        assert!(!f.matches(&packet("10.0.0.1:5353", "239.255.255.250:5353", None, None)));
+        assert!(!f.matches(&packet("10.0.0.1:5353", "224.0.0.251:1900", None, None)));
+    }
+
+    #[test]
+    fn filter_dst_port_set_matches_any_port() {
+        // One handler spanning WoL ports 7 and 9: either destination port matches.
+        let f = Filter {
+            dst_port: Some([7u16, 9].into()),
+            ..Filter::default()
+        };
+        assert!(f.matches(&packet("10.0.0.1:1", "255.255.255.255:7", None, None)));
+        assert!(f.matches(&packet("10.0.0.1:1", "255.255.255.255:9", None, None)));
+        // A port outside the set misses.
+        assert!(!f.matches(&packet("10.0.0.1:1", "255.255.255.255:8", None, None)));
     }
 
     #[test]
@@ -733,12 +813,12 @@ mod tests {
     #[test]
     fn filter_ip_does_not_match_across_families() {
         let v4 = Filter {
-            dst_ip: Some("224.0.0.251".parse().unwrap()),
+            dst_ip: Some("224.0.0.251".parse::<IpAddr>().unwrap().into()),
             ..Filter::default()
         };
         assert!(!v4.matches(&packet("[fe80::1]:5353", "[ff02::fb]:5353", None, None)));
         let v6 = Filter {
-            dst_ip: Some("ff02::fb".parse().unwrap()),
+            dst_ip: Some("ff02::fb".parse::<IpAddr>().unwrap().into()),
             ..Filter::default()
         };
         assert!(!v6.matches(&packet("10.0.0.1:5353", "224.0.0.251:5353", None, None)));
@@ -815,7 +895,7 @@ mod tests {
         dispatcher.register(
             ingress,
             Filter {
-                dst_port: Some(target.port()),
+                dst_port: Some(target.port().into()),
                 ..Filter::default()
             },
             Box::new(Echo {
@@ -1032,7 +1112,7 @@ mod tests {
         dispatcher.register(
             ingress,
             Filter {
-                dst_port: Some(target.port()),
+                dst_port: Some(target.port().into()),
                 ..Filter::default()
             },
             Box::new(Reentrant {
@@ -1085,7 +1165,7 @@ mod tests {
         dispatcher.register(
             ingress,
             Filter {
-                dst_port: Some(target.port()),
+                dst_port: Some(target.port().into()),
                 ..Filter::default()
             },
             Box::new(Echo {
@@ -1179,7 +1259,7 @@ mod tests {
         dispatcher.register(
             ingress,
             Filter {
-                dst_port: Some(target.port()),
+                dst_port: Some(target.port().into()),
                 ..Filter::default()
             },
             Box::new(MidDrainProbe {

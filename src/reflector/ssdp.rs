@@ -12,7 +12,7 @@ mod search;
 use std::net::SocketAddr;
 
 use crate::config::{AddressFamily, Reflector};
-use crate::dispatch::{CaptureKey, Filter, PacketDispatcher};
+use crate::dispatch::{CaptureKey, Filter, IpSet, PacketDispatcher};
 use crate::interface::InterfaceAddresses;
 use crate::net::ssdp::{
     SSDP_GROUP_V4, SSDP_GROUP_V6_LINK_LOCAL, SSDP_GROUP_V6_SITE_LOCAL, SSDP_PORT,
@@ -113,45 +113,47 @@ pub(crate) fn build(
         target_ifindex,
     });
 
-    for group in used_groups(reflector.address_family) {
-        let group_ip = group.ip();
-        // Advertisements are captured on target, searches on source — join both. A family with no
-        // address yet is recorded and re-attempted on the next address change.
-        if let Err(e) = dispatcher.join_group(target, group_ip) {
-            log::debug!("SSDP: join {group_ip} on target deferred: {e}");
+    // Advertisements are captured on target, searches on source — join every group on both. A family
+    // with no address yet is recorded and re-attempted on the next address change.
+    let groups = used_groups(reflector.address_family);
+    for group in &groups {
+        if let Err(e) = dispatcher.join_group(target, group.ip()) {
+            log::debug!("SSDP: join {} on target deferred: {e}", group.ip());
         }
-        if let Err(e) = dispatcher.join_group(source, group_ip) {
-            log::debug!("SSDP: join {group_ip} on source deferred: {e}");
+        if let Err(e) = dispatcher.join_group(source, group.ip()) {
+            log::debug!("SSDP: join {} on source deferred: {e}", group.ip());
         }
-        // target -> source: advertisements, optionally filtered to the configured device's MAC.
-        dispatcher.register(
-            target,
-            Filter {
-                dst_ip: Some(group_ip),
-                dst_port: Some(SSDP_PORT),
-                src_mac: reflector.macs.clone(),
-                ..Filter::default()
-            },
-            Box::new(SsdpAdvertisementReflector::new(source, dial)),
-        );
-        // source -> target: searches (unfiltered — any source client may search); each searcher's
-        // unicast 200-OK replies route back through a per-searcher session.
-        dispatcher.register(
-            source,
-            Filter {
-                dst_ip: Some(group_ip),
-                dst_port: Some(SSDP_PORT),
-                ..Filter::default()
-            },
-            Box::new(SsdpSearchReflector::new(
-                source,
-                target,
-                target_ifindex,
-                reflector.macs.clone(),
-                dial,
-            )),
-        );
     }
+    // One handler per direction spans every group; its filter matches the group set at the SSDP port.
+    let group_ips: IpSet = groups.iter().map(SocketAddr::ip).collect();
+    // target -> source: advertisements, optionally filtered to the configured device's MAC.
+    dispatcher.register(
+        target,
+        Filter {
+            dst_ip: Some(group_ips.clone()),
+            dst_port: Some(SSDP_PORT.into()),
+            src_mac: reflector.macs.clone(),
+            ..Filter::default()
+        },
+        Box::new(SsdpAdvertisementReflector::new(source, dial)),
+    );
+    // source -> target: searches (unfiltered — any source client may search); each searcher's
+    // unicast 200-OK replies route back through a per-searcher session.
+    dispatcher.register(
+        source,
+        Filter {
+            dst_ip: Some(group_ips),
+            dst_port: Some(SSDP_PORT.into()),
+            ..Filter::default()
+        },
+        Box::new(SsdpSearchReflector::new(
+            source,
+            target,
+            target_ifindex,
+            reflector.macs.clone(),
+            dial,
+        )),
+    );
     log::info!(
         "SSDP reflector \"{}\": {} <-> {} (advertisements + searches{})",
         reflector.name.as_str(),

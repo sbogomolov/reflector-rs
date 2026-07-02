@@ -8,7 +8,7 @@
 use std::net::SocketAddr;
 
 use crate::config::{AddressFamily, Reflector};
-use crate::dispatch::{Filter, PacketDispatcher};
+use crate::dispatch::{Filter, IpSet, PacketDispatcher};
 use crate::net::mdns::{MDNS_GROUP_V4, MDNS_GROUP_V6, MDNS_PORT, MDNS_TTL, MdnsKind, classify};
 
 use super::{BuildError, InterfaceMap, SimpleReflector, Verdict, require_bidirectional_families};
@@ -63,49 +63,51 @@ pub(crate) fn build(
         reflector.target_if.as_str(),
     )?;
 
-    for group in used_groups(reflector.address_family) {
-        let group_ip = group.ip();
-        // Join on both interfaces. A family with no address yet is recorded and re-attempted on
-        // the next address change, so a deferred join logs rather than fails the build.
+    // Join every group on both interfaces. A family with no address yet is recorded and re-attempted
+    // on the next address change, so a deferred join logs rather than fails the build.
+    let groups = used_groups(reflector.address_family);
+    for group in &groups {
         for capture in [source, target] {
-            if let Err(e) = dispatcher.join_group(capture, group_ip) {
-                log::debug!("mDNS: join {group_ip} deferred: {e}");
+            if let Err(e) = dispatcher.join_group(capture, group.ip()) {
+                log::debug!("mDNS: join {} deferred: {e}", group.ip());
             }
         }
-        // source → target: reflect queries (any client on source may ask).
-        dispatcher.register(
-            source,
-            Filter {
-                dst_ip: Some(group_ip),
-                dst_port: Some(MDNS_PORT),
-                ..Filter::default()
-            },
-            Box::new(SimpleReflector::new(
-                target,
-                "mDNS query",
-                MDNS_PORT,
-                MDNS_TTL,
-                query_verdict,
-            )),
-        );
-        // target → source: reflect responses, optionally only from the configured device's MAC.
-        dispatcher.register(
-            target,
-            Filter {
-                dst_ip: Some(group_ip),
-                dst_port: Some(MDNS_PORT),
-                src_mac: reflector.macs.clone(),
-                ..Filter::default()
-            },
-            Box::new(SimpleReflector::new(
-                source,
-                "mDNS response",
-                MDNS_PORT,
-                MDNS_TTL,
-                response_verdict,
-            )),
-        );
     }
+    // One handler per direction spans every group; its filter matches the group set at the mDNS port.
+    let group_ips: IpSet = groups.iter().map(SocketAddr::ip).collect();
+    // source → target: reflect queries (any client on source may ask).
+    dispatcher.register(
+        source,
+        Filter {
+            dst_ip: Some(group_ips.clone()),
+            dst_port: Some(MDNS_PORT.into()),
+            ..Filter::default()
+        },
+        Box::new(SimpleReflector::new(
+            target,
+            "mDNS query",
+            MDNS_PORT,
+            MDNS_TTL,
+            query_verdict,
+        )),
+    );
+    // target → source: reflect responses, optionally only from the configured device's MAC.
+    dispatcher.register(
+        target,
+        Filter {
+            dst_ip: Some(group_ips),
+            dst_port: Some(MDNS_PORT.into()),
+            src_mac: reflector.macs.clone(),
+            ..Filter::default()
+        },
+        Box::new(SimpleReflector::new(
+            source,
+            "mDNS response",
+            MDNS_PORT,
+            MDNS_TTL,
+            response_verdict,
+        )),
+    );
     log::info!(
         "mDNS reflector \"{}\": {} <-> {}",
         reflector.name.as_str(),

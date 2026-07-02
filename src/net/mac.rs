@@ -108,7 +108,7 @@ impl<'de> Deserialize<'de> for MacAddr {
 /// "match any device" is expressed by an absent (`None`) filter at the use site,
 /// not by an empty set.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct MacSet(Vec<MacAddr>);
+pub(crate) struct MacSet(Box<[MacAddr]>);
 
 impl Deref for MacSet {
     type Target = [MacAddr];
@@ -133,7 +133,7 @@ pub(crate) enum MacSetError {
 /// A single address is a valid one-element set.
 impl From<MacAddr> for MacSet {
     fn from(mac: MacAddr) -> Self {
-        MacSet(vec![mac])
+        MacSet(Box::from([mac]))
     }
 }
 
@@ -149,7 +149,7 @@ impl TryFrom<Vec<MacAddr>> for MacSet {
                 return Err(MacSetError::Duplicate(*mac));
             }
         }
-        Ok(Self(macs))
+        Ok(Self(macs.into_boxed_slice()))
     }
 }
 
